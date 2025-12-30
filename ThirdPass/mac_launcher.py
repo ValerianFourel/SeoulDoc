@@ -50,7 +50,7 @@ def start_coordinator_and_workers(parquet_file: str, num_workers: int = 4, headl
     
     coordinator_cmd = [
         sys.executable,
-        'coordinator_lightweight.py',
+        'coordinator_json.py',
         parquet_file
     ]
     
@@ -112,14 +112,17 @@ def start_coordinator_and_workers(parquet_file: str, num_workers: int = 4, headl
         
         # Print where to find results
         print(f"\n{'='*70}")
-        print("EXPORT RESULTS")
+        print("MERGE & EXPORT RESULTS")
         print(f"{'='*70}")
-        print(f"\nTo export results, run:")
-        print(f"  curl http://localhost:5000/export_results")
+        print(f"\nWorker JSON files are in: ./data/worker_results/")
+        print(f"\nTo merge all results into single file:")
+        print(f"  curl http://localhost:5000/merge_results")
         print(f"\nOr visit in browser:")
-        print(f"  http://localhost:5000/export_results")
-        print(f"\nResults will be saved to:")
-        print(f"  ./data/distributed_results/\n")
+        print(f"  http://localhost:5000/merge_results")
+        print(f"\nMerged files will be saved to:")
+        print(f"  ./data/reviews_merged_YYYYMMDD_HHMMSS.json")
+        print(f"  ./data/reviews_merged_YYYYMMDD_HHMMSS.csv")
+        print(f"  ./data/reviews_merged_YYYYMMDD_HHMMSS.parquet\n")
 
 
 def main():

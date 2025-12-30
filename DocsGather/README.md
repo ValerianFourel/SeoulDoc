@@ -26,9 +26,9 @@ This dataset contains comprehensive information about **unique** medical facilit
 
 ### Dataset Summary
 
-- **Unique Facilities**: 6,473
-- **Districts Covered**: 20
-- **Neighborhoods (Dong) Covered**: 230
+- **Unique Facilities**: 6,739
+- **Districts Covered**: 21
+- **Neighborhoods (Dong) Covered**: 241
 - **Collection Period**: 2025-12-28 to 2025-12-31
 - **Source**: Naver Maps
 - **Language**: Korean
