@@ -1,3 +1,5 @@
 **/seoul_medical_data
 .env
 **/data
+**/*.parquet
+
