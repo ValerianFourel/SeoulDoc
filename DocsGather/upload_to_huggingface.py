@@ -13,7 +13,7 @@ import os
 
 # HuggingFace Configuration
 HF_USERNAME = "ValerianFourel"
-HF_TOKEN = os.environ("HF_TOKEN")  # Ensure your token is set in env variables
+HF_TOKEN = os.environ.get("HF_TOKEN")  # Ensure your token is set in env variables
 DATASET_NAME = "seoul-medical-facilities"
 REPO_ID = f"{HF_USERNAME}/{DATASET_NAME}"
 

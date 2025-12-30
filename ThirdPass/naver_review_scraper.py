@@ -369,6 +369,132 @@ class NaverMapsReviewScraper:
             print(f"        ✗ Error extracting review HTML: {e}")
             return None
     
+    def search_and_click_first_result(self, facility_name: str) -> bool:
+        """
+        Search for facility by name and click first result
+        Handles click interception from rapidly loading entryIframe
+        """
+        try:
+            # Construct search URL
+            encoded_name = quote(facility_name)
+            search_url = f"https://map.naver.com/p/search/{encoded_name}"
+            
+            print(f"        🔍 Searching: {search_url}")
+            self.driver.get(search_url)
+            time.sleep(3)
+            
+            # Check if entryIframe already exists (auto-navigated to single result)
+            try:
+                self.driver.switch_to.default_content()
+                self.driver.find_element(By.ID, "entryIframe")
+                print(f"        ✓ Auto-navigated to detail page")
+                return True
+            except NoSuchElementException:
+                pass
+            
+            # Switch to search results frame (left frame)
+            try:
+                switch_left(self.driver)
+                print(f"        ✓ Switched to searchIframe")
+            except Exception as e:
+                print(f"        ✗ Could not switch to searchIframe: {e}")
+                return False
+            
+            # Wait for results to load
+            time.sleep(2)
+            
+            # Check if scroll container exists (multiple results case)
+            try:
+                scroll_container = self.driver.find_element(By.ID, "_pcmap_list_scroll_container")
+                ul_element = scroll_container.find_element(By.TAG_NAME, "ul")
+                li_elements = ul_element.find_elements(By.TAG_NAME, "li")
+                
+                if not li_elements:
+                    print(f"        ✗ No search results found")
+                    return False
+                
+                # Get first valid li element
+                first_li = None
+                for li in li_elements:
+                    if li.text.strip() or li.find_elements(By.TAG_NAME, "a"):
+                        first_li = li
+                        break
+                
+                if not first_li:
+                    print(f"        ✗ No valid results found")
+                    return False
+                
+                # Find clickable link in first result
+                link = None
+                selectors = ["a.tzwk0", "a.place_bluelink", "a[href]"]
+                
+                for selector in selectors:
+                    try:
+                        link = first_li.find_element(By.CSS_SELECTOR, selector)
+                        if link.is_displayed():
+                            break
+                    except:
+                        continue
+                
+                if not link:
+                    # Try any link
+                    links = first_li.find_elements(By.TAG_NAME, "a")
+                    for l in links:
+                        if l.is_displayed():
+                            link = l
+                            break
+                
+                if not link:
+                    print(f"        ✗ No clickable link found in first result")
+                    return False
+                
+                # Click the first result - use JavaScript if regular click fails
+                print(f"        🖱️  Clicking first result...")
+                try:
+                    link.click()
+                except Exception as click_error:
+                    # Click intercepted - try JavaScript click
+                    print(f"        ⚠ Regular click intercepted, using JavaScript...")
+                    self.driver.execute_script("arguments[0].click();", link)
+                
+                time.sleep(2)
+                
+                # Verify entryIframe appeared (even if click gave error)
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.find_element(By.ID, "entryIframe")
+                    print(f"        ✓ Detail page loaded")
+                    return True
+                except NoSuchElementException:
+                    print(f"        ⚠ entryIframe did not appear")
+                    return False
+                
+            except NoSuchElementException:
+                # No scroll container - might be single result case
+                print(f"        ⚠ No scroll container found")
+                
+                # Check if detail page already loaded in searchIframe
+                try:
+                    self.driver.find_element(By.CSS_SELECTOR, "div.place_section")
+                    print(f"        ✓ Detail content found in searchIframe")
+                    return True
+                except:
+                    pass
+                
+                # Check if entryIframe appeared anyway
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.find_element(By.ID, "entryIframe")
+                    print(f"        ✓ entryIframe appeared")
+                    return True
+                except:
+                    print(f"        ✗ No results or detail page found")
+                    return False
+            
+        except Exception as e:
+            print(f"        ✗ Error in search: {e}")
+            return False
+    
     def scrape_reviews_for_facility(self, facility_name: str, place_id: str) -> Dict:
         """Scrape all reviews for a single facility"""
         result = {
@@ -383,7 +509,12 @@ class NaverMapsReviewScraper:
         try:
             print(f"      🔍 Scraping reviews for: {facility_name}")
             
-            # Switch to detail frame (assuming we're already on the detail page)
+            # Search for facility and click first result
+            if not self.search_and_click_first_result(facility_name):
+                result['scrape_error'] = "Could not find or click search result"
+                return result
+            
+            # Switch to detail frame
             try:
                 switch_right(self.driver)
                 print("        ✓ Switched to entryIframe")
@@ -555,16 +686,7 @@ class ReviewScrapingOrchestrator:
                 print(f"  Place ID: {place_id}")
                 
                 try:
-                    # Navigate to facility page
-                    # (Assuming you have a search function like in your medical info scraper)
-                    encoded_name = quote(facility_name)
-                    search_url = f"https://map.naver.com/p/search/{encoded_name}"
-                    
-                    print(f"    🔍 Navigating to: {search_url}")
-                    scraper.driver.get(search_url)
-                    time.sleep(3)
-                    
-                    # Scrape reviews
+                    # Scrape reviews (search is handled inside this method now)
                     review_data = scraper.scrape_reviews_for_facility(facility_name, place_id)
                     
                     # Add to checkpoint
@@ -679,26 +801,134 @@ class ReviewScrapingOrchestrator:
 
 
 # ============================================================================
+# DATASET LOADING
+# ============================================================================
+
+def load_facilities_dataset(source: str = "local") -> pd.DataFrame:
+    """
+    Load facilities dataset from local file or HuggingFace
+    
+    Args:
+        source: "local" or "huggingface"
+    """
+    
+    if source == "local":
+        # Try multiple formats: CSV (most compatible), Parquet, Pickle
+        facilities_file_csv = Path("./data/seoul_medical_facilities.csv")
+        facilities_file_parquet = Path("./data/seoul_medical_facilities.parquet")
+        facilities_file_pickle = Path("./data/seoul_medical_facilities.pkl")
+        
+        print("="*70)
+        print("LOADING FACILITIES DATASET (LOCAL)")
+        print("="*70)
+        
+        # Try CSV first (most compatible, no PyArrow needed)
+        if facilities_file_csv.exists():
+            try:
+                facilities_df = pd.read_csv(facilities_file_csv)
+                print(f"✓ Loaded {len(facilities_df):,} facilities from CSV")
+                return facilities_df
+            except Exception as e:
+                print(f"⚠ Could not load CSV: {e}")
+        
+        # Try parquet
+        if facilities_file_parquet.exists():
+            try:
+                facilities_df = pd.read_parquet(facilities_file_parquet)
+                print(f"✓ Loaded {len(facilities_df):,} facilities from parquet")
+                return facilities_df
+            except Exception as e:
+                print(f"⚠ Could not load parquet: {e}")
+        
+        # Try pickle
+        if facilities_file_pickle.exists():
+            try:
+                facilities_df = pd.read_pickle(facilities_file_pickle)
+                print(f"✓ Loaded {len(facilities_df):,} facilities from pickle")
+                return facilities_df
+            except Exception as e:
+                print(f"⚠ Could not load pickle: {e}")
+        
+        # No local file found
+        print(f"⚠ No local cache found")
+        print(f"  Switching to HuggingFace download...")
+        return load_facilities_dataset(source="huggingface")
+    
+    elif source == "huggingface":
+        print("="*70)
+        print("LOADING FACILITIES DATASET (HUGGINGFACE)")
+        print("="*70)
+        
+        try:
+            from datasets import load_dataset
+        except (ImportError, ValueError) as e:
+            print(f"✗ Cannot import 'datasets' library: {e}")
+            print(f"\n" + "="*70)
+            print("MANUAL DOWNLOAD REQUIRED")
+            print("="*70)
+            print(f"\nYour PyArrow installation is broken. Please either:")
+            print(f"\n1. Fix PyArrow (recommended):")
+            print(f"   pip uninstall pyarrow")
+            print(f"   pip install pyarrow --break-system-packages")
+            print(f"\n2. OR download dataset manually:")
+            print(f"   Visit: https://huggingface.co/datasets/ValerianFourel/seoul-medical-facilities")
+            print(f"   Download as CSV")
+            print(f"   Save to: ./data/seoul_medical_facilities.csv")
+            print(f"\nThen run the script again.")
+            raise RuntimeError("Cannot load dataset - PyArrow error. See instructions above.")
+        
+        print("📥 Downloading from HuggingFace: ValerianFourel/seoul-medical-facilities")
+        
+        try:
+            dataset = load_dataset("ValerianFourel/seoul-medical-facilities")
+            facilities_df = dataset['train'].to_pandas()
+        except Exception as e:
+            print(f"✗ Download failed: {e}")
+            print(f"\nPlease download manually:")
+            print(f"1. Visit: https://huggingface.co/datasets/ValerianFourel/seoul-medical-facilities")
+            print(f"2. Download as CSV")
+            print(f"3. Save to: ./data/seoul_medical_facilities.csv")
+            raise
+        
+        print(f"✓ Downloaded {len(facilities_df):,} facilities")
+        
+        # Save to local cache (CSV for maximum compatibility)
+        cache_file_csv = Path("./data/seoul_medical_facilities.csv")
+        cache_file_csv.parent.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            facilities_df.to_csv(cache_file_csv, index=False, encoding='utf-8-sig')
+            print(f"✓ Cached to: {cache_file_csv}")
+        except Exception as e:
+            print(f"⚠ Could not save cache: {e}")
+        
+        return facilities_df
+    
+    else:
+        raise ValueError(f"Invalid source: {source}. Use 'local' or 'huggingface'")
+
+
+# ============================================================================
 # MAIN EXECUTION
 # ============================================================================
 
 def main():
     """Main execution function"""
     
-    # Load facilities dataset
-    facilities_file = Path("./data/seoul_medical_facilities.parquet")
-    
-    if not facilities_file.exists():
-        print(f"✗ Facilities file not found: {facilities_file}")
-        print("  Please run the medical facilities scraper first")
-        return
-    
     print("="*70)
     print("STEP 1: LOADING FACILITIES DATASET")
     print("="*70)
     
-    facilities_df = pd.read_parquet(facilities_file)
-    print(f"✓ Loaded {len(facilities_df):,} facilities")
+    # Try local first, fallback to HuggingFace
+    facilities_df = load_facilities_dataset(source="local")
+    
+    # Clean and validate
+    facilities_df = facilities_df[
+        facilities_df['place_id'].notna() & 
+        facilities_df['name'].notna()
+    ].copy()
+    
+    print(f"✓ {len(facilities_df):,} facilities with valid place_id and name")
     
     # Filter for hospitals/clinics if needed
     if 'name' in facilities_df.columns:
