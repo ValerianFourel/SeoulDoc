@@ -2,6 +2,7 @@
 """
 Test Naver Review Scraper with 5 Facilities
 Quick test to validate scraper functionality
+Searches by name and matches place_id from parquet
 """
 
 import pandas as pd
@@ -39,23 +40,29 @@ def get_test_facilities(num: int = 5) -> pd.DataFrame:
     print(f"  With review data: {len(with_reviews):,}")
     print(f"  Without review data: {len(without_reviews):,}")
     
-    # Sample a mix
+    # Sample a mix - prefer facilities with existing review data
     test_facilities = []
     
-    if len(with_reviews) >= 3:
-        test_facilities.append(with_reviews.sample(n=min(3, num), random_state=42))
+    # Try to get mix: 60% with reviews, 40% without
+    with_review_count = min(int(num * 0.6), len(with_reviews))
+    without_review_count = num - with_review_count
+    
+    if with_review_count > 0 and len(with_reviews) > 0:
+        test_facilities.append(with_reviews.sample(n=with_review_count, random_state=42))
+    
+    if without_review_count > 0 and len(without_reviews) > 0:
+        n_sample = min(without_review_count, len(without_reviews))
+        test_facilities.append(without_reviews.sample(n=n_sample, random_state=42))
+    
+    if test_facilities:
+        test_df = pd.concat(test_facilities, ignore_index=True).head(num)
     else:
-        test_facilities.append(with_reviews)
-    
-    remaining = num - len(test_facilities[0]) if test_facilities else num
-    if remaining > 0:
-        n_sample = min(remaining, len(without_reviews))
-        if n_sample > 0:
-            test_facilities.append(without_reviews.sample(n=n_sample, random_state=42))
-    
-    test_df = pd.concat(test_facilities, ignore_index=True).head(num)
+        # Fallback: just sample randomly
+        test_df = df.sample(n=min(num, len(df)), random_state=42)
     
     print(f"\n✓ Selected {len(test_df)} facilities for testing")
+    print(f"  With existing review data: {sum(test_df['place_id'].isin(with_reviews['place_id']))}")
+    print(f"  Without review data: {sum(test_df['place_id'].isin(without_reviews['place_id']))}")
     
     return test_df
 
@@ -76,7 +83,7 @@ def test_facility(scraper: NaverMapsReviewScraper,
     print(f"Address: {facility.get('address', 'N/A')[:50]}...")
     
     try:
-        # Navigate and scrape (search is now handled inside)
+        # Navigate and scrape (search by name, match place_id)
         review_data = scraper.scrape_reviews_for_facility(facility_name, place_id)
         
         # Print results
@@ -126,11 +133,22 @@ def test_facility(scraper: NaverMapsReviewScraper,
         }
 
 
-def run_test(num_facilities: int = 5, headless: bool = False):
-    """Run the test"""
+def run_test(num_facilities: int = 10, headless: bool = False, 
+             partition_x: int = 1, partition_y: int = 1):
+    """
+    Run the test
+    
+    Args:
+        num_facilities: Number of facilities to test
+        headless: Run in headless mode
+        partition_x: Which partition to test (1 to partition_y)
+        partition_y: Total number of partitions
+    """
     
     print("\n" + "="*70)
     print("NAVER MAPS REVIEW SCRAPER - TEST MODE")
+    if partition_y > 1:
+        print(f"PARTITION {partition_x}/{partition_y}")
     print("="*70)
     
     # Create output directory
@@ -139,6 +157,20 @@ def run_test(num_facilities: int = 5, headless: bool = False):
     
     # Get test facilities
     test_df = get_test_facilities(num_facilities)
+    
+    # Apply partitioning if requested
+    if partition_y > 1:
+        test_df = test_df.reset_index(drop=True)
+        partition_indices = list(range(partition_x - 1, len(test_df), partition_y))
+        test_df = test_df.iloc[partition_indices].copy()
+        
+        print(f"\n{'='*70}")
+        print(f"PARTITION FILTERING")
+        print(f"{'='*70}")
+        print(f"Partition {partition_x} of {partition_y}")
+        print(f"Testing {len(test_df)} facilities from this partition")
+        print(f"Pattern: Every {partition_y}th facility starting from position {partition_x}")
+        print(f"{'='*70}\n")
     
     # Initialize scraper
     print("\n" + "="*70)
@@ -153,6 +185,8 @@ def run_test(num_facilities: int = 5, headless: bool = False):
     # Test each facility
     print("\n" + "="*70)
     print(f"TESTING {len(test_df)} FACILITIES")
+    if partition_y > 1:
+        print(f"PARTITION {partition_x}/{partition_y}")
     print("="*70)
     
     results = []
@@ -161,6 +195,8 @@ def run_test(num_facilities: int = 5, headless: bool = False):
         for idx, (_, facility) in enumerate(test_df.iterrows(), 1):
             print(f"\n{'#'*70}")
             print(f"TEST {idx}/{len(test_df)}")
+            if partition_y > 1:
+                print(f"PARTITION {partition_x}/{partition_y}")
             print(f"{'#'*70}")
             
             result = test_facility(scraper, facility, output_dir)
@@ -182,6 +218,8 @@ def run_test(num_facilities: int = 5, headless: bool = False):
     # Print summary
     print("\n" + "="*70)
     print("TEST SUMMARY")
+    if partition_y > 1:
+        print(f"PARTITION {partition_x}/{partition_y}")
     print("="*70)
     
     summary_df = pd.DataFrame(results)
@@ -198,13 +236,16 @@ def run_test(num_facilities: int = 5, headless: bool = False):
     
     print("\n" + summary_df.to_string(index=False))
     
-    # Save summary
-    summary_file = output_dir / f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    # Save summary with partition suffix
+    partition_suffix = f"_p{partition_x}_of_{partition_y}" if partition_y > 1 else ""
+    summary_file = output_dir / f"summary{partition_suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     summary_df.to_csv(summary_file, index=False, encoding='utf-8-sig')
     print(f"\n💾 Summary: {summary_file}")
     
     print("\n" + "="*70)
     print("✅ TEST COMPLETE")
+    if partition_y > 1:
+        print(f"   PARTITION {partition_x}/{partition_y}")
     print("="*70)
     print(f"Results in: {output_dir}")
     
@@ -214,13 +255,27 @@ def run_test(num_facilities: int = 5, headless: bool = False):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Test scraper with 5 facilities')
-    parser.add_argument('--num', type=int, default=5, help='Number of facilities (default: 5)')
+    parser = argparse.ArgumentParser(description='Test scraper with facilities')
+    parser.add_argument('--num', type=int, default=10, help='Number of facilities (default: 10)')
     parser.add_argument('--visible', action='store_true', help='Show browser')
+    parser.add_argument(
+        '--partition-x',
+        type=int,
+        default=1,
+        help='Which partition to test (1 to partition-y)'
+    )
+    parser.add_argument(
+        '--partition-y',
+        type=int,
+        default=1,
+        help='Total number of partitions (default: 1 = test all)'
+    )
     
     args = parser.parse_args()
     
     summary = run_test(
         num_facilities=args.num,
-        headless=not args.visible
+        headless=not args.visible,
+        partition_x=args.partition_x,
+        partition_y=args.partition_y
     )

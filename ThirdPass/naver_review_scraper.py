@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 Naver Maps Review Scraper
-Scrapes reviews from Naver Maps medical facilities with automatic expansion
+Scrapes reviews from Naver Maps medical facilities
+Searches by name and matches place_id from parquet file
 """
 
 import pandas as pd
 import time
 import json
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -24,7 +26,7 @@ from selenium.webdriver.chrome.options import Options
 # Import frame switching utilities (assuming you have this)
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
-from utils.frame_switch import switch_left, switch_right
+from utils.frame_switch import switch_right
 
 
 # ============================================================================
@@ -270,32 +272,247 @@ class NaverMapsReviewScraper:
         if self.driver:
             self.driver.quit()
     
+    def clean_place_id(self, place_id) -> str:
+        """
+        Clean place_id by removing .0 if present
+        Examples: 123.0 -> "123", "123.0" -> "123", 123 -> "123"
+        """
+        place_id_str = str(place_id)
+        if place_id_str.endswith('.0'):
+            place_id_str = place_id_str[:-2]
+        return place_id_str
+    
+    def detect_iframe_structure(self) -> str:
+        """
+        Detect which iframe structure we have
+        Returns: 'single' (only entryIframe), 'dual' (both iframes), or 'none'
+        """
+        try:
+            self.driver.switch_to.default_content()
+            
+            has_entry = False
+            has_search = False
+            
+            try:
+                self.driver.find_element(By.ID, "entryIframe")
+                has_entry = True
+            except NoSuchElementException:
+                pass
+            
+            try:
+                self.driver.find_element(By.ID, "searchIframe")
+                has_search = True
+            except NoSuchElementException:
+                pass
+            
+            if has_entry and has_search:
+                return 'dual'
+            elif has_entry and not has_search:
+                return 'single'
+            else:
+                return 'none'
+                
+        except Exception as e:
+            print(f"        ⚠ Error detecting iframe structure: {e}")
+            return 'none'
+    
+    def switch_to_entry_iframe(self) -> bool:
+        """
+        Switch to entry iframe using multiple methods
+        Works for both single and dual iframe scenarios
+        """
+        try:
+            self.driver.switch_to.default_content()
+            
+            # Method 1: Try using switch_right utility
+            try:
+                switch_right(self.driver)
+                print(f"        ✓ Switched using switch_right()")
+                return True
+            except Exception as e1:
+                print(f"        ℹ️  switch_right failed: {e1}")
+                
+                # Method 2: Direct frame switch by ID
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame("entryIframe")
+                    print(f"        ✓ Switched using direct frame ID")
+                    return True
+                except Exception as e2:
+                    print(f"        ℹ️  Direct switch failed: {e2}")
+                    
+                    # Method 3: Find and switch to frame element
+                    try:
+                        self.driver.switch_to.default_content()
+                        iframe = self.driver.find_element(By.ID, "entryIframe")
+                        self.driver.switch_to.frame(iframe)
+                        print(f"        ✓ Switched using frame element")
+                        return True
+                    except Exception as e3:
+                        print(f"        ✗ All switch methods failed: {e3}")
+                        return False
+            
+        except Exception as e:
+            print(f"        ✗ Error switching to entry iframe: {e}")
+            return False
+    
+    def extract_place_id_from_url(self) -> Optional[str]:
+        """Extract place_id from current URL"""
+        try:
+            current_url = self.driver.current_url
+            match = re.search(r'/place/(\d+)', current_url)
+            if match:
+                return match.group(1)
+        except Exception as e:
+            print(f"           ⚠ Error extracting place_id: {e}")
+        return None
+    
+    def navigate_to_place_direct(self, facility_name: str, place_id: str) -> bool:
+        """
+        Navigate directly to place using combined name+place_id URL
+        URL format: https://map.naver.com/p/search/{encoded_name}/place/{place_id}
+        
+        Handles TWO scenarios:
+        1. Single iframe: Direct navigation to entryIframe (no searchIframe)
+        2. Dual iframes: Both searchIframe and entryIframe exist
+        
+        Args:
+            facility_name: Name to encode in URL
+            place_id: Place ID (will be cleaned)
+        
+        Returns:
+            True if navigation successful and on detail page
+        """
+        try:
+            # Clean place_id
+            clean_id = self.clean_place_id(place_id)
+            
+            # Encode name for URL
+            encoded_name = quote(facility_name)
+            
+            # Direct URL with both name and place_id
+            direct_url = f"https://map.naver.com/p/search/{encoded_name}/place/{clean_id}"
+            
+            print(f"        🔗 Direct URL: {direct_url}")
+            
+            # Reset to default content
+            try:
+                self.driver.switch_to.default_content()
+            except:
+                pass
+            
+            # Navigate to direct URL
+            self.driver.get(direct_url)
+            time.sleep(3)
+            
+            # Detect iframe structure
+            iframe_structure = self.detect_iframe_structure()
+            print(f"        📊 Iframe structure: {iframe_structure}")
+            
+            if iframe_structure == 'none':
+                print(f"        ✗ No iframes found - place may not exist")
+                return False
+            
+            # For both 'single' and 'dual', we need to switch to entryIframe
+            if iframe_structure in ['single', 'dual']:
+                print(f"        🎯 Switching to detail page...")
+                
+                # Use robust switching method
+                if not self.switch_to_entry_iframe():
+                    print(f"        ✗ Could not switch to entry iframe")
+                    return False
+                
+                time.sleep(1)
+                
+                # Verify detail page content loaded
+                try:
+                    self.wait.until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, 'div.place_section'))
+                    )
+                    print(f"        ✅ Detail page loaded successfully")
+                    
+                    # Verify the place_id in URL matches what we expect
+                    current_url = self.driver.current_url
+                    if clean_id in current_url:
+                        print(f"        ✅ Confirmed place_id: {clean_id}")
+                        return True
+                    else:
+                        print(f"        ⚠ URL doesn't contain expected place_id")
+                        # Still return True if detail page loaded
+                        return True
+                        
+                except TimeoutException:
+                    print(f"        ⚠ Detail page content didn't load (timeout)")
+                    return False
+                    
+            return False
+                
+        except Exception as e:
+            print(f"        ✗ Navigation error: {e}")
+            return False
+    
     def click_review_tab(self) -> bool:
-        """Click on the review tab"""
+        """Click on the review tab with retry logic"""
         try:
             print("        🔍 Looking for review tab...")
             
-            # Find review tab with data-index="1" and text "리뷰"
+            # Wait for tab menu to be present
+            try:
+                self.wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'a[data-index="1"].tpj9w._tab-menu'))
+                )
+            except:
+                print("        ⚠ Timeout waiting for tabs")
+                return False
+            
+            # Find review tab
             review_tab = self.driver.find_element(
                 By.CSS_SELECTOR, 
                 'a[data-index="1"].tpj9w._tab-menu'
             )
             
             # Verify it contains "리뷰"
-            if '리뷰' in review_tab.text:
-                print("        ✓ Found review tab")
-                review_tab.click()
-                time.sleep(2)
-                return True
-            else:
-                print("        ⚠ Found tab but doesn't contain '리뷰'")
+            if '리뷰' not in review_tab.text:
+                print("        ⚠ Tab doesn't contain '리뷰'")
                 return False
+            
+            print("        ✓ Found review tab")
+            
+            # Scroll tab into view
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
+                review_tab
+            )
+            time.sleep(0.5)
+            
+            # Click with retries
+            for attempt in range(3):
+                try:
+                    review_tab.click()
+                    time.sleep(2)
+                    return True
+                except Exception as e:
+                    if attempt < 2:
+                        print(f"        ⚠ Click attempt {attempt+1} failed, retrying...")
+                        time.sleep(1)
+                        # Try JavaScript click
+                        try:
+                            self.driver.execute_script("arguments[0].click();", review_tab)
+                            time.sleep(2)
+                            return True
+                        except:
+                            continue
+                    else:
+                        print(f"        ✗ Error clicking review tab: {e}")
+                        return False
+            
+            return False
             
         except NoSuchElementException:
             print("        ✗ Review tab not found")
             return False
         except Exception as e:
-            print(f"        ✗ Error clicking review tab: {e}")
+            print(f"        ✗ Error finding review tab: {e}")
             return False
     
     def click_expand_all_reviews(self) -> int:
@@ -369,134 +586,8 @@ class NaverMapsReviewScraper:
             print(f"        ✗ Error extracting review HTML: {e}")
             return None
     
-    def search_and_click_first_result(self, facility_name: str) -> bool:
-        """
-        Search for facility by name and click first result
-        Handles click interception from rapidly loading entryIframe
-        """
-        try:
-            # Construct search URL
-            encoded_name = quote(facility_name)
-            search_url = f"https://map.naver.com/p/search/{encoded_name}"
-            
-            print(f"        🔍 Searching: {search_url}")
-            self.driver.get(search_url)
-            time.sleep(3)
-            
-            # Check if entryIframe already exists (auto-navigated to single result)
-            try:
-                self.driver.switch_to.default_content()
-                self.driver.find_element(By.ID, "entryIframe")
-                print(f"        ✓ Auto-navigated to detail page")
-                return True
-            except NoSuchElementException:
-                pass
-            
-            # Switch to search results frame (left frame)
-            try:
-                switch_left(self.driver)
-                print(f"        ✓ Switched to searchIframe")
-            except Exception as e:
-                print(f"        ✗ Could not switch to searchIframe: {e}")
-                return False
-            
-            # Wait for results to load
-            time.sleep(2)
-            
-            # Check if scroll container exists (multiple results case)
-            try:
-                scroll_container = self.driver.find_element(By.ID, "_pcmap_list_scroll_container")
-                ul_element = scroll_container.find_element(By.TAG_NAME, "ul")
-                li_elements = ul_element.find_elements(By.TAG_NAME, "li")
-                
-                if not li_elements:
-                    print(f"        ✗ No search results found")
-                    return False
-                
-                # Get first valid li element
-                first_li = None
-                for li in li_elements:
-                    if li.text.strip() or li.find_elements(By.TAG_NAME, "a"):
-                        first_li = li
-                        break
-                
-                if not first_li:
-                    print(f"        ✗ No valid results found")
-                    return False
-                
-                # Find clickable link in first result
-                link = None
-                selectors = ["a.tzwk0", "a.place_bluelink", "a[href]"]
-                
-                for selector in selectors:
-                    try:
-                        link = first_li.find_element(By.CSS_SELECTOR, selector)
-                        if link.is_displayed():
-                            break
-                    except:
-                        continue
-                
-                if not link:
-                    # Try any link
-                    links = first_li.find_elements(By.TAG_NAME, "a")
-                    for l in links:
-                        if l.is_displayed():
-                            link = l
-                            break
-                
-                if not link:
-                    print(f"        ✗ No clickable link found in first result")
-                    return False
-                
-                # Click the first result - use JavaScript if regular click fails
-                print(f"        🖱️  Clicking first result...")
-                try:
-                    link.click()
-                except Exception as click_error:
-                    # Click intercepted - try JavaScript click
-                    print(f"        ⚠ Regular click intercepted, using JavaScript...")
-                    self.driver.execute_script("arguments[0].click();", link)
-                
-                time.sleep(2)
-                
-                # Verify entryIframe appeared (even if click gave error)
-                try:
-                    self.driver.switch_to.default_content()
-                    self.driver.find_element(By.ID, "entryIframe")
-                    print(f"        ✓ Detail page loaded")
-                    return True
-                except NoSuchElementException:
-                    print(f"        ⚠ entryIframe did not appear")
-                    return False
-                
-            except NoSuchElementException:
-                # No scroll container - might be single result case
-                print(f"        ⚠ No scroll container found")
-                
-                # Check if detail page already loaded in searchIframe
-                try:
-                    self.driver.find_element(By.CSS_SELECTOR, "div.place_section")
-                    print(f"        ✓ Detail content found in searchIframe")
-                    return True
-                except:
-                    pass
-                
-                # Check if entryIframe appeared anyway
-                try:
-                    self.driver.switch_to.default_content()
-                    self.driver.find_element(By.ID, "entryIframe")
-                    print(f"        ✓ entryIframe appeared")
-                    return True
-                except:
-                    print(f"        ✗ No results or detail page found")
-                    return False
-            
-        except Exception as e:
-            print(f"        ✗ Error in search: {e}")
-            return False
-    
     def scrape_reviews_for_facility(self, facility_name: str, place_id: str) -> Dict:
-        """Scrape all reviews for a single facility"""
+        """Scrape all reviews for a single facility using direct URL"""
         result = {
             'has_reviews': False,
             'review_count': 0,
@@ -507,21 +598,15 @@ class NaverMapsReviewScraper:
         }
         
         try:
-            print(f"      🔍 Scraping reviews for: {facility_name}")
+            print(f"      🔍 Scraping: {facility_name}")
             
-            # Search for facility and click first result
-            if not self.search_and_click_first_result(facility_name):
-                result['scrape_error'] = "Could not find or click search result"
+            # Navigate directly to place using name+place_id URL
+            if not self.navigate_to_place_direct(facility_name, place_id):
+                result['scrape_error'] = "Could not navigate to place"
                 return result
             
-            # Switch to detail frame
-            try:
-                switch_right(self.driver)
-                print("        ✓ Switched to entryIframe")
-            except Exception as e:
-                print(f"        ⚠ Could not switch to detail frame: {e}")
-                result['scrape_error'] = f"Frame switch error: {e}"
-                return result
+            # We're now on the detail page (already in entryIframe)
+            print("        ✓ On detail page")
             
             # Wait for page to load
             try:
@@ -530,7 +615,7 @@ class NaverMapsReviewScraper:
                 )
                 time.sleep(1)
             except TimeoutException:
-                print("        ⚠ Timeout waiting for page to load")
+                print("        ⚠ Timeout waiting for page")
                 result['scrape_error'] = "Page load timeout"
                 return result
             
@@ -539,14 +624,14 @@ class NaverMapsReviewScraper:
                 result['scrape_error'] = "Could not click review tab"
                 return result
             
-            # Wait for reviews to load
+            # Wait for reviews
             time.sleep(2)
             
             # Expand all reviews
             expand_clicks = self.click_expand_all_reviews()
-            print(f"        ✓ Expanded reviews with {expand_clicks} clicks")
+            print(f"        ✓ Expanded with {expand_clicks} clicks")
             
-            # Extra wait for final load
+            # Extra wait
             time.sleep(1)
             
             # Extract review HTML
@@ -566,14 +651,14 @@ class NaverMapsReviewScraper:
                 result['has_reviews'] = True
                 result['review_count'] = len(reviews)
                 result['reviews'] = reviews
-                print(f"        ✓ Successfully parsed {len(reviews)} reviews")
+                print(f"        ✅ Parsed {len(reviews)} reviews")
             else:
-                print("        ⚠ No reviews found or parsing failed")
+                print("        ⚠ No reviews found")
             
             return result
             
         except Exception as e:
-            print(f"        ✗ Error scraping reviews: {e}")
+            print(f"        ✗ Error: {e}")
             result['scrape_error'] = str(e)
             return result
 
@@ -639,18 +724,66 @@ class ReviewCheckpointManager:
 class ReviewScrapingOrchestrator:
     """Orchestrate the review scraping process"""
     
-    def __init__(self, output_dir="./data"):
+    def __init__(self, output_dir="./data", partition_x: int = 1, partition_y: int = 1):
+        """
+        Initialize orchestrator with optional partitioning
+        
+        Args:
+            output_dir: Directory for output files
+            partition_x: Which partition to process (1 to partition_y)
+            partition_y: Total number of partitions
+        """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-        self.checkpoint_mgr = ReviewCheckpointManager(
-            checkpoint_file=self.output_dir / "review_scraping_progress.json"
-        )
+        
+        # Validate partitions
+        if partition_y < 1:
+            raise ValueError(f"partition_y must be >= 1, got {partition_y}")
+        if partition_x < 1 or partition_x > partition_y:
+            raise ValueError(f"partition_x must be between 1 and {partition_y}, got {partition_x}")
+        
+        self.partition_x = partition_x
+        self.partition_y = partition_y
+        
+        # Create partition-specific checkpoint file
+        if partition_y > 1:
+            checkpoint_file = self.output_dir / f"review_scraping_progress_p{partition_x}_of_{partition_y}.json"
+            self.partition_suffix = f"_p{partition_x}_of_{partition_y}"
+        else:
+            checkpoint_file = self.output_dir / "review_scraping_progress.json"
+            self.partition_suffix = ""
+        
+        self.checkpoint_mgr = ReviewCheckpointManager(checkpoint_file=checkpoint_file)
+        
+        if partition_y > 1:
+            print(f"\n{'='*70}")
+            print(f"PARTITION MODE")
+            print(f"{'='*70}")
+            print(f"Processing partition {partition_x} of {partition_y}")
+            print(f"Checkpoint file: {checkpoint_file.name}")
+            print(f"{'='*70}\n")
     
     def scrape_all_reviews(self,
                            facilities_df: pd.DataFrame,
                            save_freq: int = 5,
                            headless: bool = True) -> Dict:
-        """Scrape reviews for all facilities"""
+        """Scrape reviews for all facilities (or partition subset)"""
+        
+        # Filter facilities by partition
+        if self.partition_y > 1:
+            # Get every Yth facility starting from position X-1 (0-indexed)
+            # Example: partition_x=2, partition_y=5 → indices 1, 6, 11, 16, 21...
+            facilities_df = facilities_df.reset_index(drop=True)
+            partition_indices = list(range(self.partition_x - 1, len(facilities_df), self.partition_y))
+            facilities_df = facilities_df.iloc[partition_indices].copy()
+            
+            print(f"\n{'='*70}")
+            print(f"PARTITION FILTERING")
+            print(f"{'='*70}")
+            print(f"Partition {self.partition_x} of {self.partition_y}")
+            print(f"Processing {len(facilities_df):,} facilities from this partition")
+            print(f"Pattern: Every {self.partition_y}th facility starting from position {self.partition_x}")
+            print(f"{'='*70}\n")
         
         scraper = NaverMapsReviewScraper(headless=headless)
         scraper.setup_driver()
@@ -661,8 +794,10 @@ class ReviewScrapingOrchestrator:
         
         print(f"\n{'='*70}")
         print(f"STARTING REVIEW SCRAPING")
+        if self.partition_y > 1:
+            print(f"PARTITION {self.partition_x}/{self.partition_y}")
         print(f"{'='*70}")
-        print(f"Total facilities: {total_facilities:,}")
+        print(f"Total facilities in partition: {total_facilities:,}")
         print(f"Already processed: {already_processed:,}")
         print(f"Remaining: {total_facilities - already_processed:,}")
         print(f"Save frequency: every {save_freq} facilities")
@@ -683,10 +818,12 @@ class ReviewScrapingOrchestrator:
                 current_total = already_processed + processed_count
                 
                 print(f"[{current_total}/{total_facilities}] {facility_name}")
+                if self.partition_y > 1:
+                    print(f"  Partition {self.partition_x}/{self.partition_y}")
                 print(f"  Place ID: {place_id}")
                 
                 try:
-                    # Scrape reviews (search is handled inside this method now)
+                    # Scrape reviews (search and match place_id)
                     review_data = scraper.scrape_reviews_for_facility(facility_name, place_id)
                     
                     # Add to checkpoint
@@ -912,8 +1049,14 @@ def load_facilities_dataset(source: str = "local") -> pd.DataFrame:
 # MAIN EXECUTION
 # ============================================================================
 
-def main():
-    """Main execution function"""
+def main(partition_x: int = 1, partition_y: int = 1):
+    """
+    Main execution function
+    
+    Args:
+        partition_x: Which partition to process (1 to partition_y)
+        partition_y: Total number of partitions (1 = process all)
+    """
     
     print("="*70)
     print("STEP 1: LOADING FACILITIES DATASET")
@@ -941,19 +1084,27 @@ def main():
     
     print("\n" + "="*70)
     print("STEP 2: SCRAPING REVIEWS")
+    if partition_y > 1:
+        print(f"PARTITION {partition_x}/{partition_y}")
     print("="*70)
     
-    orchestrator = ReviewScrapingOrchestrator(output_dir="./data")
+    orchestrator = ReviewScrapingOrchestrator(
+        output_dir="./data",
+        partition_x=partition_x,
+        partition_y=partition_y
+    )
     
     # Scrape reviews
     progress_data = orchestrator.scrape_all_reviews(
         medical_facilities,
-        save_freq=5,
+        save_freq=10,  # Save every 10 as requested
         headless=True
     )
     
     print("\n" + "="*70)
     print("STEP 3: REVIEW SCRAPING SUMMARY")
+    if partition_y > 1:
+        print(f"PARTITION {partition_x}/{partition_y}")
     print("="*70)
     
     orchestrator.print_summary()
@@ -964,22 +1115,55 @@ def main():
     
     review_df = orchestrator.create_review_dataset(medical_facilities)
     
-    output_file = Path("./data/seoul_medical_reviews.parquet")
+    # Add partition suffix to output files
+    partition_suffix = orchestrator.partition_suffix
+    
+    output_file = Path(f"./data/seoul_medical_reviews{partition_suffix}.parquet")
     review_df.to_parquet(output_file, index=False)
     print(f"✓ Saved review dataset: {output_file}")
     print(f"  Total review records: {len(review_df):,}")
     
     # Also save as CSV for easy viewing
-    csv_file = Path("./data/seoul_medical_reviews.csv")
+    csv_file = Path(f"./data/seoul_medical_reviews{partition_suffix}.csv")
     review_df.to_csv(csv_file, index=False, encoding='utf-8-sig')
     print(f"✓ Saved CSV version: {csv_file}")
     
+    if partition_y > 1:
+        print(f"\n💡 NOTE: This is partition {partition_x}/{partition_y}")
+        print(f"   Run other partitions (1-{partition_y}) to complete the full dataset")
+        print(f"   Then merge all partition files together")
+    
     print("\n" + "="*70)
     print("✅ REVIEW SCRAPING COMPLETE!")
+    if partition_y > 1:
+        print(f"   PARTITION {partition_x}/{partition_y}")
     print("="*70)
     
     return review_df
 
 
 if __name__ == "__main__":
-    review_df = main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Scrape reviews from Naver Maps with optional partitioning for parallel processing'
+    )
+    parser.add_argument(
+        '--partition-x',
+        type=int,
+        default=1,
+        help='Which partition to process (1 to partition-y)'
+    )
+    parser.add_argument(
+        '--partition-y',
+        type=int,
+        default=1,
+        help='Total number of partitions (default: 1 = process all)'
+    )
+    
+    args = parser.parse_args()
+    
+    review_df = main(
+        partition_x=args.partition_x,
+        partition_y=args.partition_y
+    )
