@@ -5,6 +5,7 @@ Features:
 - JSON-based checkpoint system with PARTITIONING for concurrent runs
 - LOGIC-BASED HTML parsing (no LLM needed!)
 - DIRECT NAVIGATION using name+place_id URL (PROVEN METHOD!)
+- RETRY LOGIC for failed entries (has_medical_info: false)
 
 PARTITIONING LOGIC:
 - Given X (partition_id) and Y (total_partitions)
@@ -12,6 +13,10 @@ PARTITIONING LOGIC:
 - Example: X=0, Y=4 processes rows 0, 4, 8, 12, ...
 - Example: X=1, Y=4 processes rows 1, 5, 9, 13, ...
 - This ensures NO overlap between partitions
+
+RETRY LOGIC:
+- Entries with has_medical_info=false will be retried on next run
+- Use --no-retry flag to skip failed entries
 """
 
 import pandas as pd
@@ -715,7 +720,7 @@ class MedicalInfoEnrichmentScraper:
 
 
 # ============================================================================
-# PARTITIONED JSON CHECKPOINT MANAGER
+# PARTITIONED JSON CHECKPOINT MANAGER (WITH RETRY LOGIC!)
 # ============================================================================
 
 class PartitionedCheckpointManager:
@@ -730,14 +735,20 @@ class PartitionedCheckpointManager:
     - Example: X=0, Y=4 → processes rows 0, 4, 8, 12, 16, ...
     - Example: X=1, Y=4 → processes rows 1, 5, 9, 13, 17, ...
     - NO OVERLAP between partitions!
+    
+    RETRY LOGIC:
+    - Facilities with has_medical_info=false will be retried
+    - This allows recovering from temporary failures
+    - Use enable_retry=False to skip failed entries
     """
     
     def __init__(self, partition_id: int, total_partitions: int,
-                 checkpoint_dir="./data"):
+                 checkpoint_dir="./data", enable_retry: bool = True):
         self.partition_id = partition_id
         self.total_partitions = total_partitions
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.enable_retry = enable_retry  # NEW: Enable retry of failed entries
         
         self.checkpoint_file = self.checkpoint_dir / f"enrichment_progress_partition_{partition_id:03d}_of_{total_partitions:03d}.json"
         
@@ -751,7 +762,18 @@ class PartitionedCheckpointManager:
         try:
             with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
                 self.progress_data = json.load(f)
-            print(f"✓ Loaded partition {self.partition_id}: {len(self.progress_data)} facilities")
+            
+            # Count successful vs failed entries
+            total = len(self.progress_data)
+            successful = sum(1 for v in self.progress_data.values() if v.get('has_medical_info'))
+            failed = total - successful
+            
+            print(f"✓ Loaded partition {self.partition_id}: {total} facilities")
+            print(f"  Successful: {successful}, Failed: {failed}")
+            
+            if self.enable_retry and failed > 0:
+                print(f"  ⚠ {failed} failed entries will be retried")
+            
         except Exception as e:
             print(f"⚠ Could not load progress file: {e}")
             self.progress_data = {}
@@ -765,8 +787,25 @@ class PartitionedCheckpointManager:
             print(f"✗ Error saving progress: {e}")
     
     def is_processed(self, place_id: str) -> bool:
-        """Check if a place_id has been processed"""
-        return place_id in self.progress_data
+        """
+        Check if a place_id has been successfully processed
+        
+        Returns:
+            True if successfully processed (has_medical_info=true)
+            False if not processed OR failed (has_medical_info=false) and retry enabled
+        """
+        if place_id not in self.progress_data:
+            return False
+        
+        # If retry is disabled, consider any entry as processed
+        if not self.enable_retry:
+            return True
+        
+        # If retry is enabled, only consider entries with medical info as processed
+        entry = self.progress_data[place_id]
+        has_info = entry.get('has_medical_info', False)
+        
+        return has_info
     
     def add_facility(self, place_id: str, medical_info: Dict):
         """Add facility enrichment result to progress"""
@@ -778,12 +817,14 @@ class PartitionedCheckpointManager:
         with_info = sum(1 for v in self.progress_data.values() if v.get('has_medical_info'))
         parsed = sum(1 for v in self.progress_data.values() if v.get('parsing_success'))
         verified = sum(1 for v in self.progress_data.values() if v.get('verified_place_id'))
+        failed = total - with_info
         
         return {
             'total_processed': total,
             'with_medical_info': with_info,
             'successfully_parsed': parsed,
-            'verified_place_id': verified
+            'verified_place_id': verified,
+            'failed': failed
         }
     
     @staticmethod
@@ -823,23 +864,25 @@ class PartitionedCheckpointManager:
 
 
 # ============================================================================
-# ENRICHMENT ORCHESTRATOR (WITH PARTITIONING!)
+# ENRICHMENT ORCHESTRATOR (WITH PARTITIONING AND RETRY!)
 # ============================================================================
 
 class EnrichmentOrchestrator:
-    """Orchestrate the enrichment process with partitioning support"""
+    """Orchestrate the enrichment process with partitioning and retry support"""
     
     def __init__(self, partition_id: int = 0, total_partitions: int = 1,
-                 output_dir="./data"):
+                 output_dir="./data", enable_retry: bool = True):
         self.partition_id = partition_id
         self.total_partitions = total_partitions
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.enable_retry = enable_retry  # NEW: Control retry behavior
         
         self.checkpoint_mgr = PartitionedCheckpointManager(
             partition_id=partition_id,
             total_partitions=total_partitions,
-            checkpoint_dir=output_dir
+            checkpoint_dir=output_dir,
+            enable_retry=enable_retry  # Pass retry setting
         )
     
     def filter_dataframe_by_partition(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -869,6 +912,7 @@ class EnrichmentOrchestrator:
         print(f"{'='*70}")
         print(f"Partition: {self.partition_id} of {self.total_partitions} (X={self.partition_id}, Y={self.total_partitions})")
         print(f"Formula: Processing rows where (row_index % {self.total_partitions}) == {self.partition_id}")
+        print(f"Retry mode: {'ENABLED (will retry failed entries)' if self.enable_retry else 'DISABLED'}")
         print(f"Original dataset size: {len(df):,} rows")
         print(f"This partition size: {len(partition_df):,} rows")
         print(f"Percentage: {100 * len(partition_df) / len(df):.1f}%")
@@ -893,14 +937,17 @@ class EnrichmentOrchestrator:
         
         stats = self.checkpoint_mgr.get_stats()
         total_in_partition = len(partition_df)
-        already_processed = stats['total_processed']
+        already_processed = stats['with_medical_info']  # Only count successful
+        failed_to_retry = stats.get('failed', 0) if self.enable_retry else 0
         
         print(f"\n{'='*70}")
         print(f"STARTING MEDICAL INFORMATION ENRICHMENT")
         print(f"PARTITION {self.partition_id} OF {self.total_partitions}")
         print(f"{'='*70}")
         print(f"Facilities in this partition: {total_in_partition:,}")
-        print(f"Already processed: {already_processed:,}")
+        print(f"Successfully processed: {already_processed:,}")
+        if self.enable_retry and failed_to_retry > 0:
+            print(f"Failed entries to retry: {failed_to_retry:,}")
         print(f"Remaining: {total_in_partition - already_processed:,}")
         print(f"Save frequency: every {save_freq} facilities")
         print(f"Parser: Logic-based (NO LLM)")
@@ -908,6 +955,8 @@ class EnrichmentOrchestrator:
         print(f"{'='*70}\n")
         
         processed_count = 0
+        retry_count = 0
+        retry_success_count = 0
         
         try:
             for idx, row in partition_df.iterrows():
@@ -918,15 +967,26 @@ class EnrichmentOrchestrator:
                 if not any(keyword in facility_name for keyword in ("의원", "병원")):
                     continue
                 
-                # Skip if already processed
-                if self.checkpoint_mgr.is_processed(place_id):
+                # Check if already successfully processed
+                is_already_done = self.checkpoint_mgr.is_processed(place_id)
+                
+                # If it's a retry, mark it
+                is_retry = place_id in self.checkpoint_mgr.progress_data and not is_already_done
+                
+                if is_already_done:
                     continue
                 
                 processed_count += 1
                 current_total = already_processed + processed_count
                 
-                print(f"[Partition {self.partition_id}] [{current_total}/{total_in_partition}] {facility_name}")
+                retry_marker = " [RETRY]" if is_retry else ""
+                print(f"[Partition {self.partition_id}] [{current_total}/{total_in_partition}] {facility_name}{retry_marker}")
                 print(f"  Place ID: {place_id}")
+                
+                if is_retry:
+                    retry_count += 1
+                    previous_error = self.checkpoint_mgr.progress_data[place_id].get('enrichment_error', 'Unknown')
+                    print(f"  ℹ️  Previous error: {previous_error}")
                 
                 try:
                     medical_info = scraper.enrich_single_facility(facility_name, place_id)
@@ -941,6 +1001,9 @@ class EnrichmentOrchestrator:
                             parsed = medical_info['medical_info_parsed']
                             fields = list(parsed.keys()) if parsed else []
                             print(f"  ✓ Extracted: {len(fields)} fields")
+                            if is_retry:
+                                retry_success_count += 1
+                                print(f"  ✅ RETRY SUCCESSFUL!")
                         else:
                             print(f"  ⚠ Found medical info but parsing empty")
                     else:
@@ -964,13 +1027,26 @@ class EnrichmentOrchestrator:
                 if processed_count % save_freq == 0:
                     self.checkpoint_mgr.save_progress()
                     stats = self.checkpoint_mgr.get_stats()
-                    print(f"  💾 Progress saved: {stats['total_processed']:,} facilities")
+                    print(f"  💾 Progress saved: {stats['with_medical_info']:,} successful, {stats['failed']:,} failed")
                 
                 time.sleep(2)
             
         finally:
             scraper.close_driver()
             self.checkpoint_mgr.save_progress()
+            
+            # Print retry summary
+            if retry_count > 0:
+                print(f"\n{'='*70}")
+                print(f"RETRY SUMMARY")
+                print(f"{'='*70}")
+                print(f"Total retries attempted: {retry_count}")
+                print(f"Retry successes: {retry_success_count}")
+                print(f"Retry failures: {retry_count - retry_success_count}")
+                final_stats = self.checkpoint_mgr.get_stats()
+                still_failed = final_stats.get('failed', 0)
+                print(f"Still failed after retry: {still_failed}")
+                print(f"{'='*70}\n")
         
         return self.checkpoint_mgr.progress_data
     
@@ -981,10 +1057,16 @@ class EnrichmentOrchestrator:
         print(f"\n{'='*70}")
         print(f"PARTITION {self.partition_id} ENRICHMENT SUMMARY")
         print(f"{'='*70}")
-        print(f"Total processed: {stats['total_processed']:,}")
-        print(f"With medical info: {stats['with_medical_info']:,}")
+        print(f"Total entries: {stats['total_processed']:,}")
+        print(f"Successful: {stats['with_medical_info']:,}")
+        print(f"Failed: {stats.get('failed', 0):,}")
         print(f"Successfully parsed: {stats['successfully_parsed']:,}")
         print(f"Verified place_id: {stats['verified_place_id']:,}")
+        
+        # Calculate success rate
+        if stats['total_processed'] > 0:
+            success_rate = 100 * stats['with_medical_info'] / stats['total_processed']
+            print(f"Success rate: {success_rate:.1f}%")
         
         all_fields = set()
         for med_info in self.checkpoint_mgr.progress_data.values():
@@ -1080,21 +1162,29 @@ class DatasetMerger:
 # MAIN EXECUTION
 # ============================================================================
 
-def main(partition_id: int = 0, total_partitions: int = 1):
+def main(partition_id: int = 0, total_partitions: int = 1, enable_retry: bool = True):
     """
     Main execution function with partitioning support
     
     Args:
         partition_id (X): Which partition to process (0-indexed, 0 to Y-1)
         total_partitions (Y): Total number of partitions
+        enable_retry: If True, retry facilities with has_medical_info=false
     
     This partition processes rows where: (row_index % Y) == X
     
+    RETRY LOGIC:
+    - If enable_retry=True: Facilities with has_medical_info=false will be retried
+    - If enable_retry=False: All entries in checkpoint are considered done
+    
     Usage:
-        # Single run (no partitioning):
+        # Single run (no partitioning, with retry):
         python script.py
         
-        # Run 4 concurrent instances (Y=4):
+        # Single run (no retry):
+        python script.py --no-retry
+        
+        # Run 4 concurrent instances (Y=4, with retry):
         python script.py --partition 0 --total 4  # X=0: rows 0,4,8,12,...
         python script.py --partition 1 --total 4  # X=1: rows 1,5,9,13,...
         python script.py --partition 2 --total 4  # X=2: rows 2,6,10,14,...
@@ -1104,6 +1194,7 @@ def main(partition_id: int = 0, total_partitions: int = 1):
     print(f"\n{'='*70}")
     print(f"SEOUL MEDICAL FACILITIES ENRICHMENT")
     print(f"PARTITION {partition_id} OF {total_partitions} (X={partition_id}, Y={total_partitions})")
+    print(f"RETRY MODE: {'ENABLED' if enable_retry else 'DISABLED'}")
     print(f"{'='*70}\n")
     
     dataset_mgr = DatasetManager(
@@ -1114,7 +1205,8 @@ def main(partition_id: int = 0, total_partitions: int = 1):
     orchestrator = EnrichmentOrchestrator(
         partition_id=partition_id,
         total_partitions=total_partitions,
-        output_dir="./data"
+        output_dir="./data",
+        enable_retry=enable_retry
     )
     
     print("="*70)
@@ -1186,18 +1278,24 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Seoul Medical Facilities Enrichment with Partitioning',
+        description='Seoul Medical Facilities Enrichment with Partitioning and Retry',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Single run (no partitioning):
+  # Single run (no partitioning, WITH retry):
   python script.py
   
-  # Run 4 concurrent instances:
+  # Single run (no retry):
+  python script.py --no-retry
+  
+  # Run 4 concurrent instances (with retry):
   python script.py --partition 0 --total 4  # Processes rows 0,4,8,12,...
   python script.py --partition 1 --total 4  # Processes rows 1,5,9,13,...
   python script.py --partition 2 --total 4  # Processes rows 2,6,10,14,...
   python script.py --partition 3 --total 4  # Processes rows 3,7,11,15,...
+  
+  # Run without retry (skip failed entries):
+  python script.py --partition 0 --total 4 --no-retry
   
   # Merge all partitions:
   python script.py --merge
@@ -1207,15 +1305,21 @@ Examples:
                        help='Partition ID X (0-indexed, 0 to Y-1)')
     parser.add_argument('--total', type=int, default=1,
                        help='Total partitions Y (processes every Y-th row)')
+    parser.add_argument('--no-retry', action='store_true',
+                       help='Disable retry of failed entries (has_medical_info=false)')
     parser.add_argument('--merge', action='store_true',
                        help='Merge all partitions into final dataset')
     
     args = parser.parse_args()
+    
+    # Convert --no-retry flag to enable_retry boolean
+    enable_retry = not args.no_retry
     
     if args.merge:
         enriched_df = merge_and_upload()
     else:
         progress_data = main(
             partition_id=args.partition,
-            total_partitions=args.total
+            total_partitions=args.total,
+            enable_retry=enable_retry
         )

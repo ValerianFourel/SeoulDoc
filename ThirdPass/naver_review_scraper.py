@@ -807,8 +807,18 @@ class ReviewScrapingOrchestrator:
         
         try:
             for idx, row in facilities_df.iterrows():
-                place_id = str(row['place_id'])
+                # Safely get place_id (handle NaN)
+                place_id = row.get('place_id')
+                if pd.isna(place_id):
+                    continue  # Skip if no place_id
+                place_id = str(place_id)
+                
+                # Safely get facility_name (handle NaN)
                 facility_name = row.get('name', 'Unknown')
+                if pd.isna(facility_name):
+                    facility_name = 'Unknown'
+                else:
+                    facility_name = str(facility_name)
                 
                 # Skip if already processed
                 if self.checkpoint_mgr.is_processed(place_id):
@@ -867,11 +877,16 @@ class ReviewScrapingOrchestrator:
         records = []
         
         for place_id, review_data in self.checkpoint_mgr.progress_data.items():
-            # Get facility info
+            # Get facility info (safely handle NaN)
             facility = facilities_df[facilities_df['place_id'].astype(str) == place_id]
             
             if len(facility) > 0:
                 facility_name = facility.iloc[0]['name']
+                # Handle NaN in facility name
+                if pd.isna(facility_name):
+                    facility_name = "Unknown"
+                else:
+                    facility_name = str(facility_name)
             else:
                 facility_name = "Unknown"
             

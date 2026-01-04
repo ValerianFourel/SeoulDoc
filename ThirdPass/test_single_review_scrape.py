@@ -75,12 +75,26 @@ def test_facility(scraper: NaverMapsReviewScraper,
     place_id = str(facility['place_id'])
     facility_name = facility['name']
     
+    # Safely get address (handle NaN/None)
+    address = facility.get('address', 'N/A')
+    if pd.isna(address) or address is None:
+        address = 'N/A'
+    else:
+        address = str(address)
+    
+    # Safely get category (handle NaN/None)
+    category = facility.get('category', 'N/A')
+    if pd.isna(category) or category is None:
+        category = 'N/A'
+    else:
+        category = str(category)
+    
     print(f"\n{'='*70}")
     print(f"FACILITY: {facility_name}")
     print(f"{'='*70}")
     print(f"Place ID: {place_id}")
-    print(f"Category: {facility.get('category', 'N/A')}")
-    print(f"Address: {facility.get('address', 'N/A')[:50]}...")
+    print(f"Category: {category}")
+    print(f"Address: {address[:50]}...")
     
     try:
         # Navigate and scrape (search by name, match place_id)
