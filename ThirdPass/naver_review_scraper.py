@@ -10,6 +10,7 @@ import time
 import json
 import os
 import re
+import csv
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -1289,7 +1290,8 @@ def load_facilities_dataset(source: str = "local") -> pd.DataFrame:
         cache_file_csv.parent.mkdir(parents=True, exist_ok=True)
         
         try:
-            facilities_df.to_csv(cache_file_csv, index=False, encoding='utf-8-sig')
+            facilities_df.to_csv(cache_file_csv, index=False, encoding='utf-8-sig',
+                               quoting=csv.QUOTE_NONNUMERIC, escapechar='\\')
             print(f"✓ Cached to: {cache_file_csv}")
         except Exception as e:
             print(f"⚠ Could not save cache: {e}")
@@ -1380,9 +1382,10 @@ def main(partition_x: int = 1, partition_y: int = 1, max_retries: int = 3):
     print(f"✓ Saved review dataset: {output_file}")
     print(f"  Total review records: {len(review_df):,}")
     
-    # Also save as CSV for easy viewing
+    # Also save as CSV for easy viewing - WITH PROPER QUOTING AND ESCAPING
     csv_file = Path(f"./data/seoul_medical_reviews{partition_suffix}.csv")
-    review_df.to_csv(csv_file, index=False, encoding='utf-8-sig')
+    review_df.to_csv(csv_file, index=False, encoding='utf-8-sig',
+                     quoting=csv.QUOTE_ALL, escapechar='\\')
     print(f"✓ Saved CSV version: {csv_file}")
     
     # Generate failed facilities report
@@ -1395,7 +1398,8 @@ def main(partition_x: int = 1, partition_y: int = 1, max_retries: int = 3):
         failed_df = orchestrator.get_failed_facilities_report(medical_facilities)
         
         failed_report_file = Path(f"./data/failed_facilities{partition_suffix}.csv")
-        failed_df.to_csv(failed_report_file, index=False, encoding='utf-8-sig')
+        failed_df.to_csv(failed_report_file, index=False, encoding='utf-8-sig',
+                        quoting=csv.QUOTE_NONNUMERIC, escapechar='\\')
         print(f"✓ Saved failed facilities report: {failed_report_file}")
         print(f"  Total failed: {len(failed_df):,}")
         print(f"  Can retry: {failed_df['can_retry'].sum():,}")
