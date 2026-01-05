@@ -519,7 +519,7 @@ class NaverMapsReviewScraper:
     def click_expand_all_reviews(self) -> int:
         """Click 'expand more' button until all reviews are loaded"""
         click_count = 0
-        max_attempts = 100  # Safety limit
+        max_attempts = 160  # Safety limit
         
         print("        📂 Expanding all reviews...")
         

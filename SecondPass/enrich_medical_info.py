@@ -6,6 +6,7 @@ Features:
 - LOGIC-BASED HTML parsing (no LLM needed!)
 - DIRECT NAVIGATION using name+place_id URL (PROVEN METHOD!)
 - RETRY LOGIC for failed entries (has_medical_info: false)
+- INCREASED WAIT TIMES for better page loading
 
 PARTITIONING LOGIC:
 - Given X (partition_id) and Y (total_partitions)
@@ -304,7 +305,7 @@ class MedicalInfoEnrichmentScraper:
         self.parser = MedicalInfoHTMLParser()
     
     def setup_driver(self):
-        """Setup Chrome WebDriver"""
+        """Setup Chrome WebDriver with INCREASED timeouts"""
         options = Options()
         
         options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -316,8 +317,8 @@ class MedicalInfoEnrichmentScraper:
             options.add_argument('--disable-dev-shm-usage')
         
         self.driver = webdriver.Chrome(options=options)
-        self.driver.implicitly_wait(3)
-        self.wait = WebDriverWait(self.driver, 10)
+        self.driver.implicitly_wait(5)  # INCREASED from 3 to 5
+        self.wait = WebDriverWait(self.driver, 20)  # INCREASED from 10 to 20
     
     def close_driver(self):
         """Close the driver"""
@@ -459,7 +460,7 @@ class MedicalInfoEnrichmentScraper:
             
             # Navigate to direct URL
             self.driver.get(direct_url)
-            time.sleep(3)
+            time.sleep(5)  # INCREASED from 3 to 5 seconds
             
             # Detect iframe structure
             iframe_structure = self.detect_iframe_structure()
@@ -478,7 +479,7 @@ class MedicalInfoEnrichmentScraper:
                     print(f"        ✗ Could not switch to entry iframe")
                     return False
                 
-                time.sleep(1)
+                time.sleep(2)  # INCREASED from 1 to 2 seconds
                 
                 # Verify detail page content loaded
                 try:
@@ -539,10 +540,10 @@ class MedicalInfoEnrichmentScraper:
                             "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
                             button
                         )
-                        time.sleep(0.3)
+                        time.sleep(0.5)  # INCREASED from 0.3 to 0.5
                         button.click()
                         clicked_count += 1
-                        time.sleep(0.3)
+                        time.sleep(0.5)  # INCREASED from 0.3 to 0.5
                 except:
                     continue
             
@@ -558,7 +559,7 @@ class MedicalInfoEnrichmentScraper:
         """Fast scroll to find 진료정보 section"""
         try:
             max_scrolls = 8
-            scroll_pause = 0.4
+            scroll_pause = 0.6  # INCREASED from 0.4 to 0.6
             
             xpath = "//h2[@class='place_section_header']//div[contains(text(), '진료정보')]"
             
@@ -612,7 +613,7 @@ class MedicalInfoEnrichmentScraper:
         }
         
         try:
-            time.sleep(1)
+            time.sleep(2)  # INCREASED from 1 to 2 seconds
             
             print("        🔍 Looking for 진료정보 section...")
             
@@ -634,10 +635,10 @@ class MedicalInfoEnrichmentScraper:
                 "arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});",
                 medical_section
             )
-            time.sleep(0.5)
+            time.sleep(0.8)  # INCREASED from 0.5 to 0.8
             
             self.click_expand_buttons_in_medical_section()
-            time.sleep(0.5)
+            time.sleep(0.8)  # INCREASED from 0.5 to 0.8
             
             html_content = self.extract_medical_info_html()
             
@@ -697,11 +698,12 @@ class MedicalInfoEnrichmentScraper:
             # We're already in entryIframe after navigate_to_place_direct
             print(f"        ✓ Already in detail page iframe")
             
-            # Wait for page to load
+            # Wait for page to load with INCREASED timeout
             try:
                 self.wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'div.place_section'))
                 )
+                time.sleep(1)  # ADDED: Extra wait after element is present
             except TimeoutException:
                 print(f"        ⚠ Timeout waiting for page to load")
                 result['enrichment_error'] = "Page load timeout"
@@ -1029,7 +1031,7 @@ class EnrichmentOrchestrator:
                     stats = self.checkpoint_mgr.get_stats()
                     print(f"  💾 Progress saved: {stats['with_medical_info']:,} successful, {stats['failed']:,} failed")
                 
-                time.sleep(2)
+                time.sleep(3)  # INCREASED from 2 to 3 seconds between facilities
             
         finally:
             scraper.close_driver()
