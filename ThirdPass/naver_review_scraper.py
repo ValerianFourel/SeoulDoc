@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Naver Maps Review Scraper
+Naver Maps Review Scraper with Robust Retry Logic
 Scrapes reviews from Naver Maps medical facilities
-Searches by name and matches place_id from parquet file
+Properly handles failures and allows retries on script relaunch
 """
 
 import pandas as pd
@@ -587,13 +587,25 @@ class NaverMapsReviewScraper:
             return None
     
     def scrape_reviews_for_facility(self, facility_name: str, place_id: str) -> Dict:
-        """Scrape all reviews for a single facility using direct URL"""
+        """
+        Scrape all reviews for a single facility using direct URL
+        
+        Returns dict with:
+        - status: 'success' or 'failed'
+        - has_reviews: bool
+        - review_count: int
+        - reviews: list
+        - review_html: str or None
+        - error_message: str or None (only if failed)
+        - scraped_at: timestamp
+        """
         result = {
+            'status': 'failed',  # Will be set to 'success' if everything works
             'has_reviews': False,
             'review_count': 0,
             'reviews': [],
             'review_html': None,
-            'scrape_error': None,
+            'error_message': None,
             'scraped_at': datetime.now().isoformat()
         }
         
@@ -602,7 +614,7 @@ class NaverMapsReviewScraper:
             
             # Navigate directly to place using name+place_id URL
             if not self.navigate_to_place_direct(facility_name, place_id):
-                result['scrape_error'] = "Could not navigate to place"
+                result['error_message'] = "Could not navigate to place"
                 return result
             
             # We're now on the detail page (already in entryIframe)
@@ -616,12 +628,12 @@ class NaverMapsReviewScraper:
                 time.sleep(1)
             except TimeoutException:
                 print("        ⚠ Timeout waiting for page")
-                result['scrape_error'] = "Page load timeout"
+                result['error_message'] = "Page load timeout"
                 return result
             
             # Click review tab
             if not self.click_review_tab():
-                result['scrape_error'] = "Could not click review tab"
+                result['error_message'] = "Could not click review tab"
                 return result
             
             # Wait for reviews
@@ -638,8 +650,22 @@ class NaverMapsReviewScraper:
             review_html = self.extract_review_list_html()
             
             if not review_html:
-                result['scrape_error'] = "Could not extract review HTML"
-                return result
+                # This might mean no reviews exist (which is OK) or extraction failed
+                # Let's check if the review tab showed 0 reviews
+                try:
+                    # If we can find the review list element but it's empty, that's success with no reviews
+                    self.driver.find_element(By.ID, '_review_list')
+                    # Found the element, so this is a successful scrape with no reviews
+                    result['status'] = 'success'
+                    result['has_reviews'] = False
+                    result['review_count'] = 0
+                    result['error_message'] = None
+                    print("        ✓ Successfully confirmed no reviews")
+                    return result
+                except NoSuchElementException:
+                    # Couldn't find review list at all - this is an error
+                    result['error_message'] = "Could not find review list element"
+                    return result
             
             result['review_html'] = review_html
             
@@ -648,31 +674,51 @@ class NaverMapsReviewScraper:
             reviews = self.parser.parse_review_list(review_html)
             
             if reviews:
+                result['status'] = 'success'
                 result['has_reviews'] = True
                 result['review_count'] = len(reviews)
                 result['reviews'] = reviews
+                result['error_message'] = None
                 print(f"        ✅ Parsed {len(reviews)} reviews")
             else:
-                print("        ⚠ No reviews found")
+                # Successfully scraped but no reviews found
+                result['status'] = 'success'
+                result['has_reviews'] = False
+                result['review_count'] = 0
+                result['error_message'] = None
+                print("        ✓ Successfully confirmed no reviews")
             
             return result
             
         except Exception as e:
             print(f"        ✗ Error: {e}")
-            result['scrape_error'] = str(e)
+            result['error_message'] = str(e)
+            result['status'] = 'failed'
             return result
 
 
 # ============================================================================
-# CHECKPOINT MANAGER
+# CHECKPOINT MANAGER WITH RETRY LOGIC
 # ============================================================================
 
 class ReviewCheckpointManager:
-    """Manage review scraping progress using JSON file"""
+    """
+    Manage review scraping progress with retry logic
     
-    def __init__(self, checkpoint_file="./data/review_scraping_progress.json"):
+    Status values:
+    - 'success': Successfully scraped (with or without reviews)
+    - 'failed': Scraping failed, should be retried
+    
+    Retry logic:
+    - Facilities with status='failed' will be retried
+    - Retry count is tracked
+    - Facilities exceeding max_retries are skipped
+    """
+    
+    def __init__(self, checkpoint_file="./data/review_scraping_progress.json", max_retries: int = 3):
         self.checkpoint_file = Path(checkpoint_file)
         self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        self.max_retries = max_retries
         self.progress_data = {}
         
         if self.checkpoint_file.exists():
@@ -682,8 +728,36 @@ class ReviewCheckpointManager:
         """Load existing progress from JSON"""
         try:
             with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
-                self.progress_data = json.load(f)
-            print(f"✓ Loaded existing progress: {len(self.progress_data)} facilities")
+                loaded_data = json.load(f)
+            
+            # Migrate old format to new format if needed
+            for place_id, data in loaded_data.items():
+                if 'status' not in data:
+                    # Old format - infer status from presence of scrape_error
+                    if data.get('scrape_error'):
+                        data['status'] = 'failed'
+                        data['error_message'] = data.get('scrape_error')
+                    else:
+                        data['status'] = 'success'
+                
+                if 'retry_count' not in data:
+                    data['retry_count'] = 0
+                
+                # Rename scrape_error to error_message for consistency
+                if 'scrape_error' in data:
+                    data['error_message'] = data.pop('scrape_error')
+            
+            self.progress_data = loaded_data
+            
+            # Count facilities by status
+            success_count = sum(1 for d in self.progress_data.values() if d.get('status') == 'success')
+            failed_count = sum(1 for d in self.progress_data.values() if d.get('status') == 'failed')
+            
+            print(f"✓ Loaded existing progress:")
+            print(f"  - {success_count:,} successful")
+            print(f"  - {failed_count:,} failed (will retry)")
+            print(f"  - Total: {len(self.progress_data):,} facilities")
+            
         except Exception as e:
             print(f"⚠ Could not load progress file: {e}")
             self.progress_data = {}
@@ -696,25 +770,98 @@ class ReviewCheckpointManager:
         except Exception as e:
             print(f"✗ Error saving progress: {e}")
     
-    def is_processed(self, place_id: str) -> bool:
-        """Check if a place_id has been processed"""
-        return place_id in self.progress_data
+    def should_process(self, place_id: str) -> bool:
+        """
+        Determine if a place_id should be processed
+        
+        Returns True if:
+        - Never processed before
+        - Previously failed and hasn't exceeded max retries
+        
+        Returns False if:
+        - Successfully processed (status='success')
+        - Failed but exceeded max retries
+        """
+        if place_id not in self.progress_data:
+            return True  # Never processed
+        
+        data = self.progress_data[place_id]
+        status = data.get('status', 'failed')
+        retry_count = data.get('retry_count', 0)
+        
+        if status == 'success':
+            return False  # Already successful, don't retry
+        
+        if status == 'failed':
+            if retry_count >= self.max_retries:
+                return False  # Exceeded max retries
+            return True  # Should retry
+        
+        return True  # Unknown status, try processing
+    
+    def get_retry_count(self, place_id: str) -> int:
+        """Get current retry count for a place_id"""
+        if place_id not in self.progress_data:
+            return 0
+        return self.progress_data[place_id].get('retry_count', 0)
     
     def add_facility(self, place_id: str, review_data: Dict):
-        """Add facility review data to progress"""
+        """
+        Add or update facility review data
+        
+        Automatically manages retry counts:
+        - If status='failed', increments retry_count
+        - If status='success', sets retry_count=0
+        """
+        # Get previous retry count if exists
+        previous_retry_count = self.get_retry_count(place_id)
+        
+        # Update retry count based on status
+        if review_data.get('status') == 'failed':
+            review_data['retry_count'] = previous_retry_count + 1
+        else:
+            review_data['retry_count'] = 0
+        
+        # Store the data
         self.progress_data[place_id] = review_data
     
     def get_stats(self) -> Dict:
         """Get statistics about current progress"""
         total = len(self.progress_data)
-        with_reviews = sum(1 for v in self.progress_data.values() if v.get('has_reviews'))
-        total_reviews = sum(v.get('review_count', 0) for v in self.progress_data.values())
+        
+        successful = sum(1 for d in self.progress_data.values() 
+                        if d.get('status') == 'success')
+        
+        with_reviews = sum(1 for d in self.progress_data.values() 
+                          if d.get('status') == 'success' and d.get('has_reviews'))
+        
+        failed = sum(1 for d in self.progress_data.values() 
+                    if d.get('status') == 'failed')
+        
+        exceeded_retries = sum(1 for d in self.progress_data.values() 
+                              if d.get('status') == 'failed' 
+                              and d.get('retry_count', 0) >= self.max_retries)
+        
+        total_reviews = sum(d.get('review_count', 0) for d in self.progress_data.values() 
+                           if d.get('status') == 'success')
         
         return {
             'total_processed': total,
+            'successful': successful,
             'with_reviews': with_reviews,
+            'failed': failed,
+            'exceeded_max_retries': exceeded_retries,
+            'pending_retry': failed - exceeded_retries,
             'total_reviews_scraped': total_reviews
         }
+    
+    def get_failed_facilities(self) -> List[str]:
+        """Get list of place_ids that failed and are pending retry"""
+        failed_ids = []
+        for place_id, data in self.progress_data.items():
+            if data.get('status') == 'failed' and data.get('retry_count', 0) < self.max_retries:
+                failed_ids.append(place_id)
+        return failed_ids
 
 
 # ============================================================================
@@ -722,16 +869,17 @@ class ReviewCheckpointManager:
 # ============================================================================
 
 class ReviewScrapingOrchestrator:
-    """Orchestrate the review scraping process"""
+    """Orchestrate the review scraping process with retry logic"""
     
-    def __init__(self, output_dir="./data", partition_x: int = 1, partition_y: int = 1):
+    def __init__(self, output_dir="./data", partition_x: int = 1, partition_y: int = 1, max_retries: int = 3):
         """
-        Initialize orchestrator with optional partitioning
+        Initialize orchestrator with optional partitioning and retry logic
         
         Args:
             output_dir: Directory for output files
             partition_x: Which partition to process (1 to partition_y)
             partition_y: Total number of partitions
+            max_retries: Maximum number of retry attempts for failed scrapes
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -744,6 +892,7 @@ class ReviewScrapingOrchestrator:
         
         self.partition_x = partition_x
         self.partition_y = partition_y
+        self.max_retries = max_retries
         
         # Create partition-specific checkpoint file
         if partition_y > 1:
@@ -753,7 +902,10 @@ class ReviewScrapingOrchestrator:
             checkpoint_file = self.output_dir / "review_scraping_progress.json"
             self.partition_suffix = ""
         
-        self.checkpoint_mgr = ReviewCheckpointManager(checkpoint_file=checkpoint_file)
+        self.checkpoint_mgr = ReviewCheckpointManager(
+            checkpoint_file=checkpoint_file,
+            max_retries=max_retries
+        )
         
         if partition_y > 1:
             print(f"\n{'='*70}")
@@ -761,18 +913,24 @@ class ReviewScrapingOrchestrator:
             print(f"{'='*70}")
             print(f"Processing partition {partition_x} of {partition_y}")
             print(f"Checkpoint file: {checkpoint_file.name}")
+            print(f"Max retries per facility: {max_retries}")
             print(f"{'='*70}\n")
     
     def scrape_all_reviews(self,
                            facilities_df: pd.DataFrame,
                            save_freq: int = 5,
                            headless: bool = True) -> Dict:
-        """Scrape reviews for all facilities (or partition subset)"""
+        """
+        Scrape reviews for all facilities (or partition subset)
+        
+        Handles retries automatically:
+        - Skips facilities that already succeeded
+        - Retries facilities that failed (up to max_retries)
+        - Saves progress regularly
+        """
         
         # Filter facilities by partition
         if self.partition_y > 1:
-            # Get every Yth facility starting from position X-1 (0-indexed)
-            # Example: partition_x=2, partition_y=5 → indices 1, 6, 11, 16, 21...
             facilities_df = facilities_df.reset_index(drop=True)
             partition_indices = list(range(self.partition_x - 1, len(facilities_df), self.partition_y))
             facilities_df = facilities_df.iloc[partition_indices].copy()
@@ -790,20 +948,23 @@ class ReviewScrapingOrchestrator:
         
         stats = self.checkpoint_mgr.get_stats()
         total_facilities = len(facilities_df)
-        already_processed = stats['total_processed']
         
         print(f"\n{'='*70}")
-        print(f"STARTING REVIEW SCRAPING")
+        print(f"STARTING REVIEW SCRAPING WITH RETRY LOGIC")
         if self.partition_y > 1:
             print(f"PARTITION {self.partition_x}/{self.partition_y}")
         print(f"{'='*70}")
         print(f"Total facilities in partition: {total_facilities:,}")
-        print(f"Already processed: {already_processed:,}")
-        print(f"Remaining: {total_facilities - already_processed:,}")
+        print(f"Already successful: {stats['successful']:,}")
+        print(f"Failed (pending retry): {stats['pending_retry']:,}")
+        print(f"Failed (exceeded retries): {stats['exceeded_max_retries']:,}")
+        print(f"Never attempted: {total_facilities - stats['total_processed']:,}")
+        print(f"Max retries per facility: {self.max_retries}")
         print(f"Save frequency: every {save_freq} facilities")
         print(f"{'='*70}\n")
         
         processed_count = 0
+        skipped_count = 0
         
         try:
             for idx, row in facilities_df.iterrows():
@@ -820,41 +981,68 @@ class ReviewScrapingOrchestrator:
                 else:
                     facility_name = str(facility_name)
                 
-                # Skip if already processed
-                if self.checkpoint_mgr.is_processed(place_id):
+                # Check if should process this facility
+                if not self.checkpoint_mgr.should_process(place_id):
+                    skipped_count += 1
+                    # Get reason for skipping
+                    data = self.checkpoint_mgr.progress_data.get(place_id, {})
+                    status = data.get('status')
+                    retry_count = data.get('retry_count', 0)
+                    
+                    if status == 'success':
+                        reason = "already successful"
+                    elif retry_count >= self.max_retries:
+                        reason = f"exceeded max retries ({retry_count}/{self.max_retries})"
+                    else:
+                        reason = "unknown"
+                    
+                    if skipped_count % 100 == 0:
+                        print(f"[Skipped {skipped_count}] {facility_name} ({reason})")
+                    
                     continue
                 
-                processed_count += 1
-                current_total = already_processed + processed_count
+                # Get retry info
+                retry_count = self.checkpoint_mgr.get_retry_count(place_id)
+                retry_info = f" (Retry {retry_count}/{self.max_retries})" if retry_count > 0 else ""
                 
-                print(f"[{current_total}/{total_facilities}] {facility_name}")
+                processed_count += 1
+                current_total = stats['successful'] + processed_count
+                
+                print(f"\n[{processed_count}/{total_facilities - skipped_count}] {facility_name}{retry_info}")
                 if self.partition_y > 1:
                     print(f"  Partition {self.partition_x}/{self.partition_y}")
                 print(f"  Place ID: {place_id}")
                 
                 try:
-                    # Scrape reviews (search and match place_id)
+                    # Scrape reviews
                     review_data = scraper.scrape_reviews_for_facility(facility_name, place_id)
                     
                     # Add to checkpoint
                     self.checkpoint_mgr.add_facility(place_id, review_data)
                     
-                    if review_data['has_reviews']:
-                        print(f"  ✓ Scraped {review_data['review_count']} reviews")
-                    else:
-                        if review_data.get('scrape_error'):
-                            print(f"  ⚠ Error: {review_data['scrape_error']}")
+                    # Print result
+                    if review_data['status'] == 'success':
+                        if review_data['has_reviews']:
+                            print(f"  ✅ SUCCESS: Scraped {review_data['review_count']} reviews")
                         else:
-                            print(f"  ℹ No reviews found")
+                            print(f"  ✅ SUCCESS: Confirmed no reviews")
+                    else:
+                        new_retry_count = review_data.get('retry_count', 0)
+                        print(f"  ❌ FAILED: {review_data.get('error_message', 'Unknown error')}")
+                        print(f"  ℹ️  Retry count: {new_retry_count}/{self.max_retries}")
+                        if new_retry_count >= self.max_retries:
+                            print(f"  ⚠️  Max retries reached - will not retry again")
                     
                 except Exception as e:
-                    print(f"  ✗ Failed: {e}")
+                    print(f"  ❌ EXCEPTION: {e}")
+                    # Record the failure
                     self.checkpoint_mgr.add_facility(place_id, {
+                        'status': 'failed',
                         'has_reviews': False,
                         'review_count': 0,
                         'reviews': [],
                         'review_html': None,
-                        'scrape_error': str(e),
+                        'error_message': str(e),
                         'scraped_at': datetime.now().isoformat()
                     })
                 
@@ -862,21 +1050,30 @@ class ReviewScrapingOrchestrator:
                 if processed_count % save_freq == 0:
                     self.checkpoint_mgr.save_progress()
                     stats = self.checkpoint_mgr.get_stats()
-                    print(f"  💾 Progress saved: {stats['total_processed']:,} facilities, {stats['total_reviews_scraped']:,} total reviews")
+                    print(f"\n  💾 Progress saved:")
+                    print(f"     Successful: {stats['successful']:,}")
+                    print(f"     Failed (pending retry): {stats['pending_retry']:,}")
+                    print(f"     Failed (max retries): {stats['exceeded_max_retries']:,}")
+                    print(f"     Total reviews: {stats['total_reviews_scraped']:,}\n")
                 
                 time.sleep(2)  # Polite delay
             
         finally:
             scraper.close_driver()
             self.checkpoint_mgr.save_progress()
+            print(f"\n✓ Final progress saved")
         
         return self.checkpoint_mgr.progress_data
     
     def create_review_dataset(self, facilities_df: pd.DataFrame) -> pd.DataFrame:
-        """Create flat dataset with review data"""
+        """Create flat dataset with review data (only from successful scrapes)"""
         records = []
         
         for place_id, review_data in self.checkpoint_mgr.progress_data.items():
+            # Only include successful scrapes
+            if review_data.get('status') != 'success':
+                continue
+            
             # Get facility info (safely handle NaN)
             facility = facilities_df[facilities_df['place_id'].astype(str) == place_id]
             
@@ -912,7 +1109,7 @@ class ReviewScrapingOrchestrator:
                     }
                     records.append(record)
             else:
-                # Create a single record for facilities with no reviews
+                # Create a single record for facilities with no reviews (but successful scrape)
                 record = {
                     'place_id': place_id,
                     'facility_name': facility_name,
@@ -935,21 +1132,64 @@ class ReviewScrapingOrchestrator:
         return pd.DataFrame(records)
     
     def print_summary(self):
-        """Print summary statistics"""
+        """Print summary statistics with retry information"""
         stats = self.checkpoint_mgr.get_stats()
         
         print(f"\n{'='*70}")
         print(f"REVIEW SCRAPING SUMMARY")
         print(f"{'='*70}")
         print(f"Total facilities processed: {stats['total_processed']:,}")
-        print(f"Facilities with reviews: {stats['with_reviews']:,}")
-        print(f"Total reviews scraped: {stats['total_reviews_scraped']:,}")
+        print(f"  ✅ Successful: {stats['successful']:,}")
+        print(f"     - With reviews: {stats['with_reviews']:,}")
+        print(f"     - Without reviews: {stats['successful'] - stats['with_reviews']:,}")
+        print(f"  ❌ Failed: {stats['failed']:,}")
+        print(f"     - Pending retry: {stats['pending_retry']:,}")
+        print(f"     - Exceeded max retries: {stats['exceeded_max_retries']:,}")
+        print(f"  📊 Total reviews scraped: {stats['total_reviews_scraped']:,}")
         
         if stats['with_reviews'] > 0:
             avg_reviews = stats['total_reviews_scraped'] / stats['with_reviews']
-            print(f"Average reviews per facility: {avg_reviews:.1f}")
+            print(f"  📈 Average reviews per facility: {avg_reviews:.1f}")
+        
+        if stats['pending_retry'] > 0:
+            print(f"\n⚠️  {stats['pending_retry']:,} facilities failed but can be retried")
+            print(f"   Run the script again to retry these facilities")
+        
+        if stats['exceeded_max_retries'] > 0:
+            print(f"\n⚠️  {stats['exceeded_max_retries']:,} facilities exceeded max retries")
+            print(f"   These will not be retried automatically")
         
         print(f"{'='*70}")
+    
+    def get_failed_facilities_report(self, facilities_df: pd.DataFrame) -> pd.DataFrame:
+        """Generate a report of failed facilities"""
+        failed_records = []
+        
+        for place_id, data in self.checkpoint_mgr.progress_data.items():
+            if data.get('status') == 'failed':
+                # Get facility info
+                facility = facilities_df[facilities_df['place_id'].astype(str) == place_id]
+                
+                if len(facility) > 0:
+                    facility_name = facility.iloc[0]['name']
+                    if pd.isna(facility_name):
+                        facility_name = "Unknown"
+                    else:
+                        facility_name = str(facility_name)
+                else:
+                    facility_name = "Unknown"
+                
+                failed_records.append({
+                    'place_id': place_id,
+                    'facility_name': facility_name,
+                    'retry_count': data.get('retry_count', 0),
+                    'max_retries': self.max_retries,
+                    'can_retry': data.get('retry_count', 0) < self.max_retries,
+                    'error_message': data.get('error_message', 'Unknown'),
+                    'last_attempt': data.get('scraped_at')
+                })
+        
+        return pd.DataFrame(failed_records)
 
 
 # ============================================================================
@@ -1064,13 +1304,14 @@ def load_facilities_dataset(source: str = "local") -> pd.DataFrame:
 # MAIN EXECUTION
 # ============================================================================
 
-def main(partition_x: int = 1, partition_y: int = 1):
+def main(partition_x: int = 1, partition_y: int = 1, max_retries: int = 3):
     """
-    Main execution function
+    Main execution function with retry logic
     
     Args:
         partition_x: Which partition to process (1 to partition_y)
         partition_y: Total number of partitions (1 = process all)
+        max_retries: Maximum retry attempts for failed facilities
     """
     
     print("="*70)
@@ -1098,7 +1339,7 @@ def main(partition_x: int = 1, partition_y: int = 1):
         medical_facilities = facilities_df
     
     print("\n" + "="*70)
-    print("STEP 2: SCRAPING REVIEWS")
+    print("STEP 2: SCRAPING REVIEWS WITH RETRY LOGIC")
     if partition_y > 1:
         print(f"PARTITION {partition_x}/{partition_y}")
     print("="*70)
@@ -1106,13 +1347,14 @@ def main(partition_x: int = 1, partition_y: int = 1):
     orchestrator = ReviewScrapingOrchestrator(
         output_dir="./data",
         partition_x=partition_x,
-        partition_y=partition_y
+        partition_y=partition_y,
+        max_retries=max_retries
     )
     
     # Scrape reviews
     progress_data = orchestrator.scrape_all_reviews(
         medical_facilities,
-        save_freq=10,  # Save every 10 as requested
+        save_freq=10,
         headless=True
     )
     
@@ -1143,6 +1385,22 @@ def main(partition_x: int = 1, partition_y: int = 1):
     review_df.to_csv(csv_file, index=False, encoding='utf-8-sig')
     print(f"✓ Saved CSV version: {csv_file}")
     
+    # Generate failed facilities report
+    stats = orchestrator.checkpoint_mgr.get_stats()
+    if stats['failed'] > 0:
+        print("\n" + "="*70)
+        print("STEP 5: FAILED FACILITIES REPORT")
+        print("="*70)
+        
+        failed_df = orchestrator.get_failed_facilities_report(medical_facilities)
+        
+        failed_report_file = Path(f"./data/failed_facilities{partition_suffix}.csv")
+        failed_df.to_csv(failed_report_file, index=False, encoding='utf-8-sig')
+        print(f"✓ Saved failed facilities report: {failed_report_file}")
+        print(f"  Total failed: {len(failed_df):,}")
+        print(f"  Can retry: {failed_df['can_retry'].sum():,}")
+        print(f"  Exceeded retries: {(~failed_df['can_retry']).sum():,}")
+    
     if partition_y > 1:
         print(f"\n💡 NOTE: This is partition {partition_x}/{partition_y}")
         print(f"   Run other partitions (1-{partition_y}) to complete the full dataset")
@@ -1154,6 +1412,16 @@ def main(partition_x: int = 1, partition_y: int = 1):
         print(f"   PARTITION {partition_x}/{partition_y}")
     print("="*70)
     
+    # Final reminder about retries
+    if stats['pending_retry'] > 0:
+        print(f"\n🔄 RETRY REMINDER:")
+        print(f"   {stats['pending_retry']:,} facilities failed but can be retried")
+        print(f"   Simply run the script again with the same arguments:")
+        if partition_y > 1:
+            print(f"   python {os.path.basename(__file__)} --partition-x {partition_x} --partition-y {partition_y} --max-retries {max_retries}")
+        else:
+            print(f"   python {os.path.basename(__file__)} --max-retries {max_retries}")
+    
     return review_df
 
 
@@ -1161,7 +1429,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Scrape reviews from Naver Maps with optional partitioning for parallel processing'
+        description='Scrape reviews from Naver Maps with retry logic and optional partitioning'
     )
     parser.add_argument(
         '--partition-x',
@@ -1175,10 +1443,17 @@ if __name__ == "__main__":
         default=1,
         help='Total number of partitions (default: 1 = process all)'
     )
+    parser.add_argument(
+        '--max-retries',
+        type=int,
+        default=3,
+        help='Maximum retry attempts for failed facilities (default: 3)'
+    )
     
     args = parser.parse_args()
     
     review_df = main(
         partition_x=args.partition_x,
-        partition_y=args.partition_y
+        partition_y=args.partition_y,
+        max_retries=args.max_retries
     )
