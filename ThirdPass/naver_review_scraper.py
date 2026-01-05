@@ -3,6 +3,7 @@
 Naver Maps Review Scraper with Robust Retry Logic
 Scrapes reviews from Naver Maps medical facilities
 Properly handles failures and allows retries on script relaunch
+INCREASED WAIT TIMES for better page loading
 """
 
 import pandas as pd
@@ -253,7 +254,7 @@ class NaverMapsReviewScraper:
         self.parser = ReviewHTMLParser()
     
     def setup_driver(self):
-        """Setup Chrome WebDriver"""
+        """Setup Chrome WebDriver with INCREASED timeouts"""
         options = Options()
         
         options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -265,8 +266,8 @@ class NaverMapsReviewScraper:
             options.add_argument('--disable-dev-shm-usage')
         
         self.driver = webdriver.Chrome(options=options)
-        self.driver.implicitly_wait(3)
-        self.wait = WebDriverWait(self.driver, 10)
+        self.driver.implicitly_wait(5)  # INCREASED from 3 to 5
+        self.wait = WebDriverWait(self.driver, 20)  # INCREASED from 10 to 20
     
     def close_driver(self):
         """Close the driver"""
@@ -404,7 +405,7 @@ class NaverMapsReviewScraper:
             
             # Navigate to direct URL
             self.driver.get(direct_url)
-            time.sleep(3)
+            time.sleep(5)  # INCREASED from 3 to 5
             
             # Detect iframe structure
             iframe_structure = self.detect_iframe_structure()
@@ -423,7 +424,7 @@ class NaverMapsReviewScraper:
                     print(f"        ✗ Could not switch to entry iframe")
                     return False
                 
-                time.sleep(1)
+                time.sleep(2)  # INCREASED from 1 to 2
                 
                 # Verify detail page content loaded
                 try:
@@ -453,11 +454,11 @@ class NaverMapsReviewScraper:
             return False
     
     def click_review_tab(self) -> bool:
-        """Click on the review tab with retry logic"""
+        """Click on the review tab with retry logic and INCREASED waits"""
         try:
             print("        🔍 Looking for review tab...")
             
-            # Wait for tab menu to be present
+            # Wait for tab menu to be present with INCREASED timeout
             try:
                 self.wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'a[data-index="1"].tpj9w._tab-menu'))
@@ -484,22 +485,22 @@ class NaverMapsReviewScraper:
                 "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
                 review_tab
             )
-            time.sleep(0.5)
+            time.sleep(0.8)  # INCREASED from 0.5 to 0.8
             
             # Click with retries
             for attempt in range(3):
                 try:
                     review_tab.click()
-                    time.sleep(2)
+                    time.sleep(3)  # INCREASED from 2 to 3
                     return True
                 except Exception as e:
                     if attempt < 2:
                         print(f"        ⚠ Click attempt {attempt+1} failed, retrying...")
-                        time.sleep(1)
+                        time.sleep(1.5)  # INCREASED from 1 to 1.5
                         # Try JavaScript click
                         try:
                             self.driver.execute_script("arguments[0].click();", review_tab)
-                            time.sleep(2)
+                            time.sleep(3)  # INCREASED from 2 to 3
                             return True
                         except:
                             continue
@@ -517,9 +518,9 @@ class NaverMapsReviewScraper:
             return False
     
     def click_expand_all_reviews(self) -> int:
-        """Click 'expand more' button until all reviews are loaded"""
+        """Click 'expand more' button until all reviews are loaded with INCREASED waits"""
         click_count = 0
-        max_attempts = 160  # Safety limit
+        max_attempts = 200  # Safety limit
         
         print("        📂 Expanding all reviews...")
         
@@ -538,7 +539,7 @@ class NaverMapsReviewScraper:
                         "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
                         expand_button
                     )
-                    time.sleep(0.5)
+                    time.sleep(0.7)  # INCREASED from 0.5 to 0.7
                     
                     # Click the button
                     try:
@@ -548,7 +549,7 @@ class NaverMapsReviewScraper:
                         self.driver.execute_script("arguments[0].click();", expand_button)
                     
                     click_count += 1
-                    time.sleep(1)  # Wait for reviews to load
+                    time.sleep(1.5)  # INCREASED from 1 to 1.5 - wait for reviews to load
                     
                     if click_count % 10 == 0:
                         print(f"        ✓ Clicked expand button {click_count} times")
@@ -621,12 +622,12 @@ class NaverMapsReviewScraper:
             # We're now on the detail page (already in entryIframe)
             print("        ✓ On detail page")
             
-            # Wait for page to load
+            # Wait for page to load with INCREASED wait
             try:
                 self.wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'div.place_section'))
                 )
-                time.sleep(1)
+                time.sleep(2)  # INCREASED from 1 to 2
             except TimeoutException:
                 print("        ⚠ Timeout waiting for page")
                 result['error_message'] = "Page load timeout"
@@ -637,15 +638,15 @@ class NaverMapsReviewScraper:
                 result['error_message'] = "Could not click review tab"
                 return result
             
-            # Wait for reviews
-            time.sleep(2)
+            # Wait for reviews with INCREASED wait
+            time.sleep(3)  # INCREASED from 2 to 3
             
             # Expand all reviews
             expand_clicks = self.click_expand_all_reviews()
             print(f"        ✓ Expanded with {expand_clicks} clicks")
             
-            # Extra wait
-            time.sleep(1)
+            # Extra wait with INCREASED time
+            time.sleep(2)  # INCREASED from 1 to 2
             
             # Extract review HTML
             review_html = self.extract_review_list_html()
@@ -1057,7 +1058,7 @@ class ReviewScrapingOrchestrator:
                     print(f"     Failed (max retries): {stats['exceeded_max_retries']:,}")
                     print(f"     Total reviews: {stats['total_reviews_scraped']:,}\n")
                 
-                time.sleep(2)  # Polite delay
+                time.sleep(3)  # INCREASED from 2 to 3 - Polite delay between facilities
             
         finally:
             scraper.close_driver()
