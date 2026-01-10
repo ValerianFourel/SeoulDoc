@@ -1,166 +1,173 @@
 """
-Load review scraping JSON data and analyze structure
-Excludes 'review_html' field to avoid long outputs
+Check the last review in the review scraping JSON data
 """
 
 import json
-from typing import Dict, List, Set
+from typing import Dict, Any, List
 from pathlib import Path
+from datetime import datetime
 
 
-def load_review_json(file_path: str, exclude_keys: List[str] = None) -> Dict:
-    """
-    Load JSON file and exclude specified keys from each record
-    
-    Args:
-        file_path: Path to the JSON file
-        exclude_keys: List of keys to exclude (default: ['review_html'])
-    
-    Returns:
-        Dictionary with place_id as keys
-    """
-    if exclude_keys is None:
-        exclude_keys = ['review_html']
-    
+def load_json(file_path: str) -> Dict:
+    """Load JSON file"""
     print(f"Loading: {file_path}")
-    
     with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
-    # Remove excluded keys from each record
-    cleaned_data = {}
-    for place_id, record in data.items():
-        if isinstance(record, dict):
-            cleaned_record = {k: v for k, v in record.items() if k not in exclude_keys}
-            cleaned_data[place_id] = cleaned_record
-        else:
-            cleaned_data[place_id] = record
-    
-    return cleaned_data
+    print(f"✅ Loaded {len(data):,} places\n")
+    return data
 
 
-def analyze_structure(data: Dict) -> None:
+def find_last_review(data: Dict) -> None:
     """
-    Analyze and display the structure of the loaded data
+    Find and display the last review(s) in the data
     
     Args:
         data: Dictionary with place_id as keys
     """
     print("=" * 80)
-    print("DATA STRUCTURE ANALYSIS")
+    print("ANALYZING REVIEWS STRUCTURE")
     print("=" * 80)
     
-    # Total number of places
-    print(f"\n📊 Total places: {len(data):,}")
-    
-    # Get all unique keys across all records
-    all_keys: Set[str] = set()
-    for record in data.values():
-        if isinstance(record, dict):
-            all_keys.update(record.keys())
-    
-    print(f"\n📋 Unique keys found across all records:")
-    for i, key in enumerate(sorted(all_keys), 1):
-        print(f"   {i:2d}. {key}")
-    
-    # Show key frequency (how many records have each key)
-    print(f"\n📊 Key frequency:")
-    key_counts = {key: 0 for key in all_keys}
-    for record in data.values():
-        if isinstance(record, dict):
-            for key in record.keys():
-                key_counts[key] += 1
-    
-    for key in sorted(key_counts.keys()):
-        count = key_counts[key]
-        percentage = (count / len(data)) * 100
-        print(f"   {key:30s}: {count:6,} / {len(data):,} ({percentage:5.1f}%)")
-    
-    # Sample first record structure
-    print(f"\n👀 Sample record structure (first place):")
+    # Check first few places to understand structure
+    print("\n🔍 Checking review structure in first place...")
     first_place_id = next(iter(data.keys()))
     first_record = data[first_place_id]
     
-    print(f"\n   Place ID: {first_place_id}")
-    if isinstance(first_record, dict):
-        print(f"   Keys in this record: {list(first_record.keys())}")
-        print(f"\n   Detailed structure:")
-        for key, value in first_record.items():
-            value_type = type(value).__name__
-            if isinstance(value, (list, dict)):
-                value_len = len(value)
-                print(f"      {key:30s}: {value_type:10s} (length: {value_len})")
-            elif isinstance(value, str):
-                value_preview = value[:50] + "..." if len(value) > 50 else value
-                print(f"      {key:30s}: {value_type:10s} = '{value_preview}'")
-            else:
-                print(f"      {key:30s}: {value_type:10s} = {value}")
+    print(f"\nPlace ID: {first_place_id}")
+    print(f"Record keys: {list(first_record.keys())}")
     
-    return all_keys, key_counts
+    # Check if there's a 'reviews' field
+    if 'reviews' in first_record:
+        reviews = first_record['reviews']
+        print(f"\n✅ Found 'reviews' field")
+        print(f"   Type: {type(reviews).__name__}")
+        
+        if isinstance(reviews, list):
+            print(f"   Number of reviews: {len(reviews)}")
+            if len(reviews) > 0:
+                print(f"\n   Last review (index {len(reviews)-1}):")
+                last_review = reviews[-1]
+                print_review(last_review, indent=6)
+                
+                # Also show first review for comparison
+                print(f"\n   First review (index 0) for comparison:")
+                first_review = reviews[0]
+                print_review(first_review, indent=6)
+        elif isinstance(reviews, dict):
+            print(f"   Number of reviews: {len(reviews)}")
+            print(f"   Review keys: {list(reviews.keys())[:5]}...")
+    else:
+        print("\n❌ No 'reviews' field found")
+        print(f"   Available fields: {list(first_record.keys())}")
+    
+    # Show last reviews from multiple places
+    print("\n" + "=" * 80)
+    print("LAST REVIEWS FROM MULTIPLE PLACES")
+    print("=" * 80)
+    
+    for i, (place_id, record) in enumerate(list(data.items())[:5], 1):
+        print(f"\n{i}. Place ID: {place_id}")
+        if 'name' in record:
+            print(f"   Name: {record['name']}")
+        
+        if 'reviews' in record and isinstance(record['reviews'], list):
+            reviews = record['reviews']
+            if len(reviews) > 0:
+                print(f"   Total reviews: {len(reviews)}")
+                print(f"   Last review:")
+                print_review(reviews[-1], indent=6)
+            else:
+                print(f"   No reviews found")
+        else:
+            print(f"   No reviews list found")
+        print("-" * 80)
 
 
-def show_sample_records(data: Dict, n: int = 3) -> None:
+def print_review(review: Any, indent: int = 0) -> None:
     """
-    Show a few sample records
+    Print review details with proper formatting
+    
+    Args:
+        review: Review data (could be dict, string, or other)
+        indent: Number of spaces for indentation
+    """
+    indent_str = " " * indent
+    
+    if isinstance(review, dict):
+        for key, value in review.items():
+            if key == 'review_html':
+                print(f"{indent_str}{key}: [HTML content - skipped]")
+            elif isinstance(value, str):
+                if len(value) > 100:
+                    print(f"{indent_str}{key}: {value[:100]}...")
+                else:
+                    print(f"{indent_str}{key}: {value}")
+            elif isinstance(value, list):
+                print(f"{indent_str}{key}: [list with {len(value)} items]")
+                if len(value) > 0 and len(value) <= 3:
+                    for item in value:
+                        print(f"{indent_str}  - {item}")
+            elif isinstance(value, dict):
+                print(f"{indent_str}{key}: [dict with {len(value)} keys]")
+            else:
+                print(f"{indent_str}{key}: {value}")
+    elif isinstance(review, str):
+        if len(review) > 200:
+            print(f"{indent_str}{review[:200]}...")
+        else:
+            print(f"{indent_str}{review}")
+    else:
+        print(f"{indent_str}{review}")
+
+
+def get_review_statistics(data: Dict) -> None:
+    """
+    Get statistics about reviews across all places
     
     Args:
         data: Dictionary with place_id as keys
-        n: Number of samples to show
     """
     print("\n" + "=" * 80)
-    print(f"SAMPLE RECORDS (first {n})")
+    print("REVIEW STATISTICS")
     print("=" * 80)
     
-    for i, (place_id, record) in enumerate(list(data.items())[:n], 1):
-        print(f"\n{i}. Place ID: {place_id}")
-        print("-" * 80)
-        
-        if isinstance(record, dict):
-            for key, value in record.items():
-                if isinstance(value, list):
-                    print(f"   {key:25s}: list with {len(value)} items")
-                    if value and len(value) > 0:
-                        print(f"      First item type: {type(value[0]).__name__}")
-                elif isinstance(value, dict):
-                    print(f"   {key:25s}: dict with {len(value)} keys")
-                elif isinstance(value, str):
-                    value_preview = value[:100] + "..." if len(value) > 100 else value
-                    print(f"   {key:25s}: '{value_preview}'")
-                else:
-                    print(f"   {key:25s}: {value}")
-        else:
-            print(f"   Record type: {type(record).__name__}")
-            print(f"   Value: {record}")
-
-
-def export_keys_summary(all_keys: Set[str], key_counts: Dict[str, int], 
-                       output_file: str = "keys_summary.txt") -> None:
-    """
-    Export keys summary to a text file
+    total_places_with_reviews = 0
+    total_reviews = 0
+    max_reviews = 0
+    max_reviews_place = None
     
-    Args:
-        all_keys: Set of all unique keys
-        key_counts: Dictionary with key frequencies
-        output_file: Output file path
-    """
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("=" * 80 + "\n")
-        f.write("KEYS SUMMARY\n")
-        f.write("=" * 80 + "\n\n")
-        
-        f.write(f"Total unique keys: {len(all_keys)}\n\n")
-        
-        f.write("All keys (sorted):\n")
-        for i, key in enumerate(sorted(all_keys), 1):
-            count = key_counts.get(key, 0)
-            f.write(f"   {i:2d}. {key:30s} (appears in {count:,} records)\n")
+    review_keys = set()
     
-    print(f"\n✅ Keys summary exported to: {output_file}")
+    for place_id, record in data.items():
+        if 'reviews' in record and isinstance(record['reviews'], list):
+            reviews = record['reviews']
+            if len(reviews) > 0:
+                total_places_with_reviews += 1
+                total_reviews += len(reviews)
+                
+                if len(reviews) > max_reviews:
+                    max_reviews = len(reviews)
+                    max_reviews_place = place_id
+                
+                # Collect all unique keys from reviews
+                for review in reviews:
+                    if isinstance(review, dict):
+                        review_keys.update(review.keys())
+    
+    print(f"\n📊 Places with reviews: {total_places_with_reviews:,} / {len(data):,}")
+    print(f"📊 Total reviews: {total_reviews:,}")
+    if total_places_with_reviews > 0:
+        print(f"📊 Average reviews per place: {total_reviews / total_places_with_reviews:.1f}")
+    print(f"📊 Max reviews in one place: {max_reviews:,} (Place ID: {max_reviews_place})")
+    
+    print(f"\n📋 Unique keys found in review objects:")
+    for i, key in enumerate(sorted(review_keys), 1):
+        print(f"   {i:2d}. {key}")
 
 
 if __name__ == "__main__":
     # File path
-    json_file = "data/review_scraping_progress_p52_of_60.json"
+    json_file = "review_scraping_progress_p1_of_60.json"
     
     # Alternative paths to try
     possible_paths = [
@@ -182,30 +189,22 @@ if __name__ == "__main__":
         for path in possible_paths:
             print(f"   - {path}")
         print("\n💡 Please make sure the file exists or update the path.")
+        print("\n📝 Expected file name: review_scraping_progress_p1_of_60.json")
         exit(1)
     
     try:
-        # Load the JSON (excluding review_html)
-        data = load_review_json(file_found, exclude_keys=['review_html'])
+        # Load the JSON
+        data = load_json(file_found)
         
-        print(f"✅ Successfully loaded {len(data):,} records")
-        print(f"   (Excluded fields: review_html)")
+        # Find and display last review(s)
+        find_last_review(data)
         
-        # Analyze structure
-        all_keys, key_counts = analyze_structure(data)
+        # Get review statistics
+        get_review_statistics(data)
         
-        # Show sample records
-        show_sample_records(data, n=3)
-        
-        # Export keys summary
-        export_keys_summary(all_keys, key_counts, 
-                          output_file="/mnt/user-data/outputs/keys_summary.txt")
-        
-        # Save the cleaned data (without review_html) for further analysis
-        output_json = "/mnt/user-data/outputs/review_data_cleaned.json"
-        with open(output_json, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"✅ Cleaned data saved to: {output_json}")
+        print("\n" + "=" * 80)
+        print("✅ ANALYSIS COMPLETE")
+        print("=" * 80)
         
     except Exception as e:
         print(f"\n❌ Error: {e}")
