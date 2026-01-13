@@ -33,6 +33,10 @@ MODEL_NAME = "Qwen/Qwen3-32B"
 TEST_MODE = True  # Set to False for full production run
 TEST_SAMPLE_SIZE = 5
 
+# Test mode settings
+PRINT_FULL_PROMPT = True  # Set to False to only print preview in test mode
+PRINT_FULL_OUTPUT = True  # Set to False to only print preview of API response in test mode
+
 # Performance Settings
 BATCH_SIZE = 50
 MAX_TOKENS_OUTPUT = 4000  # Increased for meta-summaries
@@ -216,6 +220,9 @@ def create_meta_prompt(original_prompt: str, n_reviews: int, n_summaries: int) -
         original_prompt: Pre-computed prompt with filtered reviews
         n_reviews: Total number of reviews for this facility
         n_summaries: Number of summaries to generate
+    
+    Returns:
+        Full enhanced prompt (NEVER truncated)
     """
     
     if n_summaries == 0:
@@ -242,6 +249,7 @@ The reviews have been carefully selected and grouped by topic relevance.
 Synthesize this rich context into {n_summaries} high-quality summaries.
 """
     
+    # Return FULL prompt (never truncated)
     return original_prompt + context_addition + "\n\nProvide the output strictly as a JSON object."
 
 def combine_results(facility_obj: Dict, llm_response: Dict) -> Dict:
@@ -331,13 +339,6 @@ def run_test_mode(client, facility_data):
         print(f"   Removed: {removed_chars:,} chars ({removed_chars/len(original_prompt)*100:.1f}%)")
         print()
         
-        # Show cleaned prompt preview
-        print(f"📝 CLEANED PROMPT (pre-filtered reviews):")
-        print(f"{'─'*70}")
-        prompt_preview = cleaned_prompt[:800] if len(cleaned_prompt) > 800 else cleaned_prompt
-        print(prompt_preview + "..." if len(cleaned_prompt) > 800 else prompt_preview)
-        print()
-        
         # Create meta-prompt with CLEANED prompt
         meta_prompt = create_meta_prompt(cleaned_prompt, n_reviews, n_summaries)
         
@@ -345,23 +346,55 @@ def run_test_mode(client, facility_data):
             print(f"   ⚠️ Skipped due to insufficient reviews\n")
             continue
         
-        print(f"🔧 META-ENHANCED PROMPT (sent to API):")
-        print(f"{'─'*70}")
-        # Show last part with meta context
-        print("..." + meta_prompt[-600:])
-        print()
+        # SHOW FULL PROMPT (what will actually be sent to API)
+        if PRINT_FULL_PROMPT:
+            print(f"📝 FULL PROMPT SENT TO API:")
+            print(f"{'─'*70}")
+            print(f"[START OF PROMPT]")
+            print(f"{'═'*70}")
+            print(meta_prompt)
+            print(f"{'═'*70}")
+            print(f"[END OF PROMPT]")
+            print(f"\nPrompt Length: {len(meta_prompt):,} characters")
+            print()
+        else:
+            # Show preview only
+            print(f"📝 PROMPT PREVIEW (first 1000 chars):")
+            print(f"{'─'*70}")
+            print(meta_prompt[:1000] + "...")
+            print(f"\n... [MIDDLE SECTION OMITTED] ...\n")
+            print(f"📝 PROMPT PREVIEW (last 600 chars):")
+            print(f"{'─'*70}")
+            print("..." + meta_prompt[-600:])
+            print(f"\nFull Prompt Length: {len(meta_prompt):,} characters")
+            print()
         
-        # Generate
-        print(f"🚀 Sending to {MODEL_NAME}...")
+        # Generate (always send FULL prompt)
+        print(f"🚀 Sending FULL prompt to {MODEL_NAME}...")
+        print(f"   Sending {len(meta_prompt):,} characters to API...")
         output = generate_with_retry(client, meta_prompt)
         
         if output:
             print(f"✅ Received response\n")
             
-            print(f"📤 RAW API RESPONSE:")
-            print(f"{'─'*70}")
-            print(output[:1000] + "..." if len(output) > 1000 else output)
-            print()
+            # PRINT FULL OR PREVIEW OUTPUT BASED ON FLAG
+            if PRINT_FULL_OUTPUT:
+                print(f"📤 FULL RAW API RESPONSE:")
+                print(f"{'─'*70}")
+                print(f"[START OF RESPONSE]")
+                print(f"{'═'*70}")
+                print(output)
+                print(f"{'═'*70}")
+                print(f"[END OF RESPONSE]")
+                print(f"\nResponse Length: {len(output):,} characters")
+                print()
+            else:
+                # Show preview only
+                print(f"📤 RAW API RESPONSE (preview):")
+                print(f"{'─'*70}")
+                print(output[:1000] + "..." if len(output) > 1000 else output)
+                print(f"\nFull Response Length: {len(output):,} characters")
+                print()
             
             json_data = extract_json(output)
             if json_data:
@@ -396,6 +429,10 @@ def run_test_mode(client, facility_data):
                     print(f"\n   Sample Summary (EN, from LLM):")
                     print(f"      {combined_result['Summaries'][0][:200]}...")
                 
+                if combined_result.get('Summaries_Korean'):
+                    print(f"\n   Sample Summary (KO, from LLM):")
+                    print(f"      {combined_result['Summaries_Korean'][0][:200]}...")
+                
                 print()
             else:
                 print(f"   ❌ Failed to extract JSON from output\n")
@@ -428,6 +465,7 @@ def run_test_mode(client, facility_data):
     print(f"   ✓ Facility, Total_Reviews, Key_Highlights: Ground truth from Part 4")
     print(f"   ✓ Summaries, Summaries_Korean: Generated by LLM")
     print(f"   ✓ Reduces hallucination risk on metadata")
+    print(f"   ✓ Full prompts always sent to API (never truncated)")
     print(f"{'='*70}\n")
     
     return results
@@ -440,6 +478,8 @@ def run_production_mode(client, facility_data):
     print(f"\n{'='*70}")
     print(f"🚀 PRODUCTION MODE - Processing All {len(facility_data):,} Facilities")
     print(f"{'='*70}\n")
+    print(f"⚠️ NOTE: Full prompts always sent to API (never truncated)")
+    print()
     
     state = GenerationState(STATE_FILE)
     
@@ -475,6 +515,7 @@ def run_production_mode(client, facility_data):
             n_summaries = facility_obj['n_summaries']
             
             # Create meta-prompt with CLEANED prompt (will return None if < 10 reviews)
+            # This always returns FULL prompt (never truncated)
             meta_prompt = create_meta_prompt(cleaned_prompt, n_reviews, n_summaries)
             
             if not meta_prompt:
@@ -483,7 +524,7 @@ def run_production_mode(client, facility_data):
                 failed_calls += 1
                 continue
             
-            # Generate
+            # Generate - ALWAYS send FULL prompt
             output = generate_with_retry(client, meta_prompt)
             api_calls += 1
             
@@ -535,6 +576,7 @@ def run_production_mode(client, facility_data):
     print(f"\n💡 Output Structure:")
     print(f"   ✓ Metadata from Part 4: Facility, Total_Reviews, Key_Highlights")
     print(f"   ✓ Generated by LLM: Summaries, Summaries_Korean")
+    print(f"   ✓ Full prompts always sent to API (never truncated)")
     print(f"{'='*70}")
 
 # ==========================================
@@ -546,6 +588,9 @@ def main():
     print("Uses pre-computed metadata + LLM summaries")
     print("Reduces hallucination risk on metadata")
     print(f"Mode: {'🧪 TEST' if TEST_MODE else '🚀 PRODUCTION'}")
+    if TEST_MODE:
+        print(f"Print Full Prompt: {'YES' if PRINT_FULL_PROMPT else 'NO (preview only)'}")
+        print(f"Print Full Output: {'YES' if PRINT_FULL_OUTPUT else 'NO (preview only)'}")
     print("="*70)
     
     # Load Data
