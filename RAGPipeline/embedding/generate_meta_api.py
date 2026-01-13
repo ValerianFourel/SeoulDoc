@@ -1,815 +1,577 @@
 """
-Seoul Medical Reviews - Part 1-4: Clustering, Labeling & Prompt Preparation
-===========================================================================
-Enhanced with percentile-based cluster labeling
-WITH PROXIMITY ORDERING: Reviews ranked by distance to cluster centroid
-Global cluster ranking + facility-specific cluster ranking
-INCLUDING CLOSEST REVIEW TO CENTROID
-FULL REVIEW TEXT IN PROMPTS (up to 5 reviews per cluster per facility)
-ROBUST OUTPUT STRUCTURE: Separating Input Data from Prompt Text
+Seoul Medical Reviews - Part 5: Meta Summary Generation via API (Qwen 3)
+========================================================================
+Uses pre-computed prompts with reviews already filtered by relevance threshold.
+SAVES: Pre-computed metadata from Part 4 + LLM-generated summaries only
 """
 
-import cupy as cp
-import cuml
-import numpy as np
 import json
-import torch
-import gc
 import pandas as pd
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from openai import OpenAI
 from tqdm import tqdm
 import os
 import pickle
-
-# Set CuPy cache to scratch
-os.environ['CUPY_CACHE_DIR'] = '/p/scratch/obdifflearn/fourel/.cupy_cache'
-os.makedirs(os.environ['CUPY_CACHE_DIR'], exist_ok=True)
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+from datetime import datetime
+import time
+from typing import List, Dict, Any, Optional
+import random
+import re
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-INPUT_EMBEDDINGS = "../../../seoul-medical-facilities/seoul_medical_reviews_embeddings.parquet"
-INPUT_METADATA = "../../../seoul-medical-facilities/seoul_medical_reviews_with_embeddings_metadata.parquet"
+INPUT_PROMPTS = "../../../seoul-medical-facilities/seoul_medical_facility_prompts.pkl"
+OUTPUT_FILE = "../../../seoul-medical-facilities/seoul_medical_rag_knowledge.parquet"
+STATE_FILE = "../../../seoul-medical-facilities/generation_state_qwen3.json"
 
-# Output files for intermediate data
-OUTPUT_CLUSTERS = "../../../seoul-medical-facilities/seoul_medical_cluster_labels.parquet"
-OUTPUT_VOCABULARY = "../../../seoul-medical-facilities/seoul_medical_cluster_vocabulary.pkl"
-OUTPUT_PROMPTS = "../../../seoul-medical-facilities/seoul_medical_facility_prompts.pkl"
-OUTPUT_METADATA = "../../../seoul-medical-facilities/seoul_medical_facility_metadata.pkl"
+# API Configuration
+API_BASE_URL = "https://api.deepinfra.com/v1/openai" 
+API_KEY = os.environ.get("QWEN_API_KEY")
+MODEL_NAME = "Qwen/Qwen3-32B"
 
-LABEL_LLM_ID = "Qwen/Qwen2.5-14B-Instruct"
+# MODE SELECTION
+TEST_MODE = True  # Set to False for full production run
+TEST_SAMPLE_SIZE = 5
 
-N_GLOBAL_CLUSTERS = 1500  # Increased from 1250
-MIN_REVIEWS_FACILITY = 10
-BATCH_SIZE_LABEL = 12
+# Performance Settings
+BATCH_SIZE = 50
+MAX_TOKENS_OUTPUT = 4000  # Increased for meta-summaries
+TEMPERATURE = 0.6
+MAX_RETRIES = 3
+RETRY_DELAY = 2
 
-PRIMARY_GPU = 0
+# Rate limiting
+REQUESTS_PER_MINUTE = 100 
+DELAY_BETWEEN_REQUESTS = 60 / REQUESTS_PER_MINUTE
 
-# Clustering method: 'kmeans' or 'gmm'
-CLUSTERING_METHOD = 'kmeans'
-
-# Percentiles for representative review selection (after the closest one)
-REPRESENTATIVE_PERCENTILES = [10, 20, 30, 50, 90]  # 5 reviews at different distances
-# Total: 6 reviews (1 closest + 5 at percentiles)
-
-# Number of reviews to include per cluster in facility prompts
-N_REVIEWS_PER_CLUSTER = 5  # Up to 5 closest reviews per cluster
-
-# ==========================================
-# ADAPTIVE CALCULATORS
-# ==========================================
-def calculate_num_summaries(n_reviews):
-    """Adaptive summary count based on review volume"""
-    if n_reviews < 10:
-        return 0
-    elif n_reviews < 30:
-        return 3
-    elif n_reviews < 75:
-        return 5
-    elif n_reviews < 150:
-        return 6
-    elif n_reviews < 300:
-        return 7
-    elif n_reviews < 500:
-        return 8
-    elif n_reviews < 1000:
-        return 9
-    else:
-        return 10
-
-def calculate_min_relevance_threshold(n_reviews):
-    """Calculate minimum relevance threshold"""
-    if n_reviews < 50:
-        return 0.10
-    elif n_reviews < 100:
-        return 0.08
-    elif n_reviews < 200:
-        return 0.05
-    elif n_reviews < 500:
-        return 0.03
-    elif n_reviews < 1000:
-        return 0.02
-    else:
-        return 0.01
-
-def calculate_max_highlights(n_reviews):
-    """Calculate maximum highlights"""
-    if n_reviews < 50:
-        return 10
-    elif n_reviews < 100:
-        return 15
-    elif n_reviews < 200:
-        return 20
-    elif n_reviews < 500:
-        return 25
-    elif n_reviews < 1000:
-        return 30
-    else:
-        return 40
+# Checkpoint settings
+CHECKPOINT_EVERY_N_BATCHES = 5
 
 # ==========================================
-# HELPER FUNCTIONS
+# PROMPT CLEANING
 # ==========================================
-def clear_gpu_memory(gpu_ids=None):
-    """Clear GPU memory"""
-    gc.collect()
-    if gpu_ids:
-        for gpu_id in gpu_ids:
-            with torch.cuda.device(gpu_id):
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-    else:
-        for i in range(torch.cuda.device_count()):
-            with torch.cuda.device(i):
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+def clean_cluster_references(prompt: str) -> str:
+    """
+    Remove cluster number references from prompts.
+    Removes patterns like:
+    - 'Medical service cluster 172' / '의료 서비스 클러스터 172'
+    - 'cluster 42' / '클러스터 42'
+    """
+    # Remove English cluster references
+    # Pattern: "cluster" followed by optional space and digits
+    prompt = re.sub(r'\bcluster\s*\d+\b', '', prompt, flags=re.IGNORECASE)
+    
+    # Remove Korean cluster references
+    # Pattern: "클러스터" followed by optional space and digits
+    prompt = re.sub(r'클러스터\s*\d+', '', prompt)
+    
+    # Clean up resulting artifacts:
+    # Multiple spaces to single space
+    prompt = re.sub(r'\s{2,}', ' ', prompt)
+    
+    # Space before slash
+    prompt = re.sub(r'\s+/', ' /', prompt)
+    
+    # Remove lines that become empty or just "Medical service /" or similar
+    lines = []
+    for line in prompt.split('\n'):
+        cleaned = line.strip()
+        # Skip if line is now just "Medical service /" or "의료 서비스 /" or similar artifacts
+        if cleaned and not re.match(r'^[A-Za-z\s가-힣]+/\s*$', cleaned):
+            lines.append(line)
+        elif cleaned and '/' in cleaned and len(cleaned.split('/')[0].strip()) > 3:
+            # Keep lines with actual content before the slash
+            lines.append(line)
+    
+    return '\n'.join(lines)
 
-def setup_llm_single_gpu(model_id, gpu_id):
-    """Setup LLM on a single GPU"""
-    try:
-        print(f"Loading {model_id} on GPU {gpu_id} (FP16)...")
+# ==========================================
+# STATE MANAGEMENT
+# ==========================================
+class GenerationState:
+    """Manages generation state for resume capability"""
+    
+    def __init__(self, state_file):
+        self.state_file = state_file
+        self.state = self.load_state()
+    
+    def load_state(self):
+        """Load existing state or create new"""
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                print(f"   📂 Loaded existing state:")
+                print(f"      Last batch: {state.get('last_batch_idx', 0)}")
+                print(f"      Processed: {state.get('facilities_processed', 0)}")
+                return state
+            except json.JSONDecodeError:
+                print("   ⚠️ State file corrupted. Starting fresh.")
         
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_id, 
-            trust_remote_code=True,
-            padding_side='left'
-        )
+        return {
+            'last_batch_idx': 0,
+            'facilities_processed': 0,
+            'total_facilities': 0,
+            'records_saved': 0,
+            'success_rate': 0.0,
+            'api_calls': 0,
+            'failed_calls': 0,
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    def save_state(self, batch_idx, facilities_processed, total_facilities, 
+                   records_saved, api_calls, failed_calls):
+        """Save current state"""
+        self.state.update({
+            'last_batch_idx': batch_idx,
+            'facilities_processed': facilities_processed,
+            'total_facilities': total_facilities,
+            'records_saved': records_saved,
+            'success_rate': (records_saved / facilities_processed * 100) if facilities_processed > 0 else 0,
+            'api_calls': api_calls,
+            'failed_calls': failed_calls,
+            'timestamp': datetime.now().isoformat()
+        })
         
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            device_map={"": gpu_id},
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True
-        )
-        
-        model.eval()
-        allocated = torch.cuda.memory_allocated(gpu_id) / 1e9
-        print(f"   ✓ Model loaded: {allocated:.2f} GB on GPU {gpu_id}")
-        
-        return model, tokenizer
-        
-    except Exception as e:
-        print(f"❌ Model loading failed: {e}")
-        return None, None
+        with open(self.state_file, 'w') as f:
+            json.dump(self.state, f, indent=2)
 
-def generate_batch(model, tokenizer, prompts, max_new_tokens=100, temperature=0.3):
-    """Generate text for batch"""
-    inputs = tokenizer(
-        prompts, 
-        return_tensors="pt", 
-        padding=True, 
-        truncation=True,
-        max_length=2560
+# ==========================================
+# API HELPER FUNCTIONS
+# ==========================================
+def setup_api_client():
+    """Initialize Standard OpenAI Client pointing to Qwen 3 Provider"""
+    if not API_KEY:
+        raise ValueError("API key not found! Set 'QWEN_API_KEY' environment variable.")
+    
+    client = OpenAI(
+        api_key=API_KEY,
+        base_url=API_BASE_URL
     )
     
-    device = next(model.parameters()).device
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    print(f"   ✓ OpenAI Client Initialized")
+    print(f"   ✓ Base URL: {API_BASE_URL}")
+    print(f"   ✓ Target Model: {MODEL_NAME}")
+    print(f"   ✓ Temperature: {TEMPERATURE}")
     
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            top_p=0.95,
-            top_k=50,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=True
-        )
-    
-    generated_texts = []
-    for i, output in enumerate(outputs):
-        input_length = inputs['input_ids'][i].shape[0]
-        generated = output[input_length:]
-        text = tokenizer.decode(generated, skip_special_tokens=True)
-        generated_texts.append(text)
-    
-    return generated_texts
+    return client
 
-def extract_json(text):
-    """Extract JSON from text"""
-    try:
-        if "{" in text and "}" in text:
-            json_str = text[text.find('{'):text.rfind('}')+1]
-            return json.loads(json_str)
-        return None
-    except:
-        return None
+def generate_with_retry(client, prompt: str, max_retries: int = MAX_RETRIES) -> Optional[str]:
+    """Generate text with Qwen 3 using OpenAI client"""
+    system_msg = """You are a helpful assistant. You must output valid JSON only. No markdown, no explanations.
+Reviews are pre-filtered and grouped by relevance. Generate comprehensive meta-summaries from the provided context."""
 
-def main():
-    print("="*70)
-    print("Seoul Medical Reviews - Part 1-4: Preparation")
-    print(f"Clusters: {N_GLOBAL_CLUSTERS}")
-    print(f"Method: {CLUSTERING_METHOD.upper()}")
-    print(f"Representatives: CLOSEST + Percentiles {REPRESENTATIVE_PERCENTILES}")
-    print(f"Reviews per cluster in prompts: {N_REVIEWS_PER_CLUSTER}")
-    print(f"WITH GLOBAL & FACILITY-SPECIFIC PROXIMITY ORDERING")
-    print("="*70)
-    
-    # ---------------------------------------------------------
-    # STEP 1: LOAD EMBEDDINGS
-    # ---------------------------------------------------------
-    print(f"\n[1/4] Loading embeddings...")
-    
-    df_embeddings = pd.read_parquet(INPUT_EMBEDDINGS)
-    df_metadata = pd.read_parquet(INPUT_METADATA)
-    
-    df_full = df_metadata.merge(df_embeddings[['review_id', 'embedding']], on='review_id')
-    df_host = df_full[df_full['script_type'].isin(['Hangul', 'Mixed'])].copy()
-    
-    print(f"   Filtered: {len(df_host):,} reviews")
-    
-    reviews_per_facility = df_host.groupby('place_id').size()
-    print(f"   Facilities: {len(reviews_per_facility):,}")
-    print(f"   Median: {reviews_per_facility.median():.0f} | Mean: {reviews_per_facility.mean():.1f}")
-    
-    # Load to GPU
-    print(f"\n   Loading to GPU {PRIMARY_GPU}...")
-    with cp.cuda.Device(PRIMARY_GPU):
-        embeddings_list = df_host['embedding'].tolist()
-        embeddings_array = np.array(embeddings_list, dtype=np.float32)
-        embeddings_gpu = cp.asarray(embeddings_array)
-        print(f"   ✓ Memory: {embeddings_array.nbytes / 1e9:.2f} GB")
-    
-    texts = df_host['review_text'].tolist()
-    del embeddings_array, embeddings_list
-
-    # ---------------------------------------------------------
-    # STEP 2: CLUSTERING
-    # ---------------------------------------------------------
-    print(f"\n[2/4] Clustering on GPU {PRIMARY_GPU} ({CLUSTERING_METHOD.upper()})")
-    
-    with cp.cuda.Device(PRIMARY_GPU):
-        if CLUSTERING_METHOD == 'gmm':
-            print(f"   Using GMM (Gaussian Mixture Models)...")
-            from cuml.mixture import GaussianMixture
-            
-            gmm = GaussianMixture(
-                n_components=N_GLOBAL_CLUSTERS,
-                covariance_type='diag',
-                max_iter=300,
-                random_state=42,
-                verbose=0
-            )
-            gmm.fit(embeddings_gpu)
-            
-            global_labels = gmm.predict(embeddings_gpu)
-            centroids = gmm.means_
-            centroids_cpu = centroids.get()
-            
-        else:  # kmeans (default)
-            print(f"   Using KMeans...")
-            kmeans = cuml.KMeans(
-                n_clusters=N_GLOBAL_CLUSTERS, 
-                n_init=10,
-                max_iter=900,
-                random_state=42,
-                verbose=0
-            )
-            kmeans.fit(embeddings_gpu)
-            
-            global_labels = kmeans.labels_
-            centroids = kmeans.cluster_centers_
-            centroids_cpu = centroids.get()
-    
-    df_host['cluster_id'] = global_labels.get()
-    
-    cluster_sizes = df_host['cluster_id'].value_counts()
-    print(f"   ✓ Range: {cluster_sizes.min()}-{cluster_sizes.max()} | Median: {cluster_sizes.median():.0f}")
-    
-    # ---------------------------------------------------------
-    # COMPUTE PROXIMITY TO CENTROID
-    # ---------------------------------------------------------
-    print(f"\n   Computing proximity to cluster centroids...")
-    
-    with cp.cuda.Device(PRIMARY_GPU):
-        # Calculate cosine similarity to assigned centroid for each review
-        centroid_similarities = cp.zeros(len(df_host), dtype=cp.float32)
-        
-        for cluster_id in tqdm(range(N_GLOBAL_CLUSTERS), desc="Similarities"):
-            cluster_mask = global_labels == cluster_id
-            cluster_indices = cp.where(cluster_mask)[0]
-            
-            if len(cluster_indices) == 0:
-                continue
-            
-            # Get centroid for this cluster
-            centroid = cp.asarray(centroids_cpu[cluster_id])
-            
-            # Get embeddings for reviews in this cluster
-            cluster_embeddings = embeddings_gpu[cluster_indices]
-            
-            # Calculate cosine similarity
-            centroid_norm = centroid / cp.linalg.norm(centroid)
-            embeddings_norm = cluster_embeddings / cp.linalg.norm(cluster_embeddings, axis=1, keepdims=True)
-            
-            similarities = cp.dot(embeddings_norm, centroid_norm)
-            centroid_similarities[cluster_indices] = similarities
-        
-        # Convert to numpy
-        similarity_scores = centroid_similarities.get()
-    
-    df_host['centroid_similarity'] = similarity_scores
-    
-    print(f"   ✓ Similarity range: [{similarity_scores.min():.4f}, {similarity_scores.max():.4f}]")
-    print(f"   ✓ Mean similarity: {similarity_scores.mean():.4f}")
-    
-    # ---------------------------------------------------------
-    # GLOBAL CLUSTER RANKING
-    # ---------------------------------------------------------
-    print(f"\n   Ranking reviews globally within each cluster...")
-    
-    # Global rank: rank within cluster_id only (across all facilities)
-    df_host['global_cluster_rank'] = df_host.groupby('cluster_id')['centroid_similarity'].rank(
-        method='first', 
-        ascending=False
-    ).astype(int)
-    
-    # Global cluster size
-    df_host['global_cluster_size'] = df_host.groupby('cluster_id')['cluster_id'].transform('count')
-    
-    print(f"   ✓ Average reviews per cluster: {df_host['global_cluster_size'].mean():.1f}")
-    print(f"   ✓ Max reviews in one cluster: {df_host['global_cluster_size'].max()}")
-    
-    # ---------------------------------------------------------
-    # FACILITY-SPECIFIC CLUSTER RANKING
-    # ---------------------------------------------------------
-    print(f"\n   Ranking reviews within (place_id, cluster_id) groups...")
-    
-    # Facility-specific rank
-    df_host['facility_cluster_rank'] = df_host.groupby(['place_id', 'cluster_id'])['centroid_similarity'].rank(
-        method='first', 
-        ascending=False
-    ).astype(int)
-    
-    # Cluster size within each facility
-    df_host['facility_cluster_size'] = df_host.groupby(['place_id', 'cluster_id'])['cluster_id'].transform('count')
-    
-    print(f"   ✓ Average reviews per (place_id, cluster_id): {df_host['facility_cluster_size'].mean():.1f}")
-    print(f"   ✓ Max reviews in one (place_id, cluster_id): {df_host['facility_cluster_size'].max()}")
-    
-    # Save clusters with proximity information
-    cluster_df = df_host[[
-        'review_id', 
-        'place_id', 
-        'cluster_id',
-        'centroid_similarity',
-        'global_cluster_rank',
-        'global_cluster_size',
-        'facility_cluster_rank',
-        'facility_cluster_size'
-    ]].copy()
-    
-    cluster_df.to_parquet(OUTPUT_CLUSTERS, index=False)
-    print(f"   ✓ Saved to {OUTPUT_CLUSTERS}")
-    
-    # Show sample
-    print(f"\n   📊 Sample Rankings (first cluster):")
-    sample = cluster_df[cluster_df['cluster_id'] == 0].nsmallest(10, 'global_cluster_rank')
-    print(sample[['cluster_id', 'global_cluster_rank', 'facility_cluster_rank', 
-                  'centroid_similarity', 'global_cluster_size']].to_string())
-
-    # ---------------------------------------------------------
-    # STEP 3: PERCENTILE-BASED LABELING
-    # ---------------------------------------------------------
-    print(f"\n[3/4] Percentile-based cluster labeling...")
-    print(f"   Using CLOSEST review + reviews at percentiles: {REPRESENTATIVE_PERCENTILES}")
-    
-    cluster_representatives = {}
-    cluster_percentile_info = {}
-    
-    # Create a mapping from global index to review text and cluster
-    print(f"\n   Extracting representatives (closest + percentiles)...")
-    
-    for cluster_id in tqdm(range(N_GLOBAL_CLUSTERS), desc="Representatives"):
-        # Get all reviews in this cluster
-        cluster_mask = df_host['cluster_id'] == cluster_id
-        cluster_data = df_host[cluster_mask].copy()
-        
-        if len(cluster_data) == 0:
-            cluster_representatives[cluster_id] = ["No reviews in cluster"]
-            cluster_percentile_info[cluster_id] = {}
-            continue
-        
-        # Sort by similarity (descending = closer to centroid)
-        cluster_data = cluster_data.sort_values('centroid_similarity', ascending=False)
-        
-        # Get reviews: CLOSEST first, then percentiles
-        representatives = []
-        percentile_details = {}
-        
-        # 1. CLOSEST REVIEW TO CENTROID (Rank 1)
-        closest_review = cluster_data.iloc[0]
-        representatives.append(closest_review['review_text'])
-        percentile_details['CLOSEST'] = {
-            'position': 1,
-            'total': len(cluster_data),
-            'similarity': closest_review['centroid_similarity']
-        }
-        
-        # 2. REVIEWS AT PERCENTILES
-        for percentile in REPRESENTATIVE_PERCENTILES:
-            # Convert percentile to index (percentile from the top)
-            position = int((percentile / 100.0) * len(cluster_data))
-            position = min(position, len(cluster_data) - 1)
-            
-            # Skip if it's the same as closest (for very small clusters)
-            if position == 0:
-                continue
-            
-            review_row = cluster_data.iloc[position]
-            review_text = review_row['review_text']
-            similarity = review_row['centroid_similarity']
-            
-            representatives.append(review_text)
-            percentile_details[percentile] = {
-                'position': position + 1,
-                'total': len(cluster_data),
-                'similarity': similarity
-            }
-        
-        cluster_representatives[cluster_id] = representatives
-        cluster_percentile_info[cluster_id] = percentile_details
-    
-    # Free GPU 0
-    print(f"\n   Freeing GPU {PRIMARY_GPU}...")
-    del embeddings_gpu, centroids, centroids_cpu, centroid_similarities, similarity_scores
-    if CLUSTERING_METHOD == 'kmeans':
-        del kmeans
-    else:
-        del gmm
-    del global_labels
-    
-    with cp.cuda.Device(PRIMARY_GPU):
-        cp.get_default_memory_pool().free_all_blocks()
-    
-    clear_gpu_memory([PRIMARY_GPU])
-    
-    # Load labeling model
-    print(f"\n   Loading Labeling LLM on GPU 1...")
-    label_model, label_tokenizer = setup_llm_single_gpu(LABEL_LLM_ID, gpu_id=1)
-    
-    if label_model is None:
-        print("❌ Failed to load labeling model!")
-        return
-    
-    # PERCENTILE-BASED LABEL PROMPTS (WITH CLOSEST)
-    prompts = []
-    keys = sorted(cluster_representatives.keys())
-    
-    for k in keys:
-        reps = cluster_representatives[k]
-        percentile_info = cluster_percentile_info[k]
-        
-        # Format reviews with position information
-        reps_formatted = []
-        
-        # First one is always CLOSEST
-        if 'CLOSEST' in percentile_info:
-            info = percentile_info['CLOSEST']
-            reps_formatted.append(
-                f"[CLOSEST - Rank 1/{info['total']} - Sim: {info['similarity']:.3f}]\n{reps[0]}"
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=MAX_TOKENS_OUTPUT,
+                temperature=TEMPERATURE,
+                top_p=0.9,
+                response_format={"type": "json_object"} 
             )
             
-            # Then add percentile-based reviews
-            for i, percentile in enumerate(REPRESENTATIVE_PERCENTILES, start=1):
-                if i < len(reps) and percentile in percentile_info:
-                    info = percentile_info[percentile]
-                    reps_formatted.append(
-                        f"[P{percentile} - Rank {info['position']}/{info['total']} - Sim: {info['similarity']:.3f}]\n{reps[i]}"
-                    )
-        else:
-            # Fallback if no reviews
-            reps_formatted = [str(r) for r in reps]
-        
-        reps_text = "\n\n".join(reps_formatted)
-        
-        prompt = f"""You are analyzing Korean medical facility reviews to identify the SPECIFIC topic of this cluster.
-
-REPRESENTATIVE REVIEWS FROM CLUSTER:
-{reps_text}
-
-EXPLANATION OF REVIEW SELECTION:
-- CLOSEST: The most representative review, closest to the cluster centroid
-- P10-P30: Still close to centroid, representative of core cluster
-- P50: Middle of the cluster  
-- P90: Further from centroid (edge cases, still relevant)
-
-TASK:
-Based on these {len(reps)} reviews spanning from closest to centroid to edge cases, identify the SPECIFIC medical topic or aspect being discussed.
-
-REQUIREMENTS:
-1. The label MUST be DESCRIPTIVE and SPECIFIC (3-8 words)
-2. Be CONCRETE, not vague or generic
-3. Capture the CORE medical aspect that unifies all reviews
-4. Focus primarily on CLOSEST and P10-P30 reviews as they are most representative
-
-GOOD EXAMPLES:
-- "Friendly pediatric staff with detailed explanations"
-- "Long waiting times during peak hours"
-- "Modern clean facilities and equipment"
-- "Skilled orthopedic surgeons with experience"
-- "Affordable prices compared to other clinics"
-- "Convenient parking and accessibility"
-- "Professional dermatology consultation service"
-
-BAD EXAMPLES (too vague):
-- "General Service" ❌
-- "Good" ❌
-- "Medical care" ❌
-- "Treatment" ❌
-
-OUTPUT ONLY THIS JSON FORMAT:
-{{"en": "Specific descriptive label (3-8 words)", "ko": "구체적인 설명 라벨 (3-8단어)"}}
-
-EXAMPLE OUTPUT:
-{{"en": "Experienced pediatric doctors with gentle care", "ko": "부드러운 진료를 제공하는 경험 많은 소아과 의사"}}"""
-        
-        prompts.append(prompt)
-    
-    cluster_vocabulary = {}
-    
-    print(f"   Labeling {len(prompts)} clusters with closest + percentile-based prompts...")
-    for i in tqdm(range(0, len(prompts), BATCH_SIZE_LABEL), desc="Labeling"):
-        batch_prompts = prompts[i:i+BATCH_SIZE_LABEL]
-        batch_keys = keys[i:i+BATCH_SIZE_LABEL]
-        
-        outputs = generate_batch(
-            label_model, 
-            label_tokenizer, 
-            batch_prompts, 
-            max_new_tokens=120,
-            temperature=0.3
-        )
-        
-        for k, output_text in zip(batch_keys, outputs):
-            data = extract_json(output_text)
-            if data and 'en' in data and 'ko' in data:
-                # Validate minimum length
-                en_words = len(data['en'].split())
-                if en_words >= 3:
-                    cluster_vocabulary[k] = data
-                else:
-                    # Fallback if too short
-                    cluster_vocabulary[k] = {
-                        "en": f"{data['en']} medical service",
-                        "ko": f"{data['ko']} 의료 서비스"
-                    }
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = RETRY_DELAY * (2 ** attempt)
+                if "429" in str(e):
+                    print(f"\n   ⏳ Rate limit (429). Waiting {wait_time}s...")
+                time.sleep(wait_time)
             else:
-                # Better fallback based on cluster ID
-                cluster_vocabulary[k] = {
-                    "en": f"Medical service cluster {k}",
-                    "ko": f"의료 서비스 클러스터 {k}"
-                }
+                print(f"\n   ❌ Failed after {max_retries} attempts: {str(e)[:100]}")
+                return None
     
-    print(f"   ✓ Labeled {len(cluster_vocabulary)} clusters")
-    
-    # Show sample labels with info
-    print(f"\n   📋 Sample Labels (first 10 clusters):")
-    for i, (cid, label) in enumerate(list(cluster_vocabulary.items())[:10], 1):
-        cluster_size = df_host[df_host['cluster_id'] == cid]['global_cluster_size'].iloc[0]
-        closest_sim = cluster_percentile_info[cid].get('CLOSEST', {}).get('similarity', 0)
-        print(f"   {i}. [{cid}] (n={cluster_size}, closest_sim={closest_sim:.3f})")
-        print(f"       EN: {label['en']}")
-        print(f"       KO: {label['ko']}")
-    
-    # Save vocabulary with percentile info
-    vocabulary_with_info = {
-        'labels': cluster_vocabulary,
-        'percentile_info': cluster_percentile_info,
-        'percentiles_used': ['CLOSEST'] + REPRESENTATIVE_PERCENTILES
-    }
-    
-    with open(OUTPUT_VOCABULARY, 'wb') as f:
-        pickle.dump(vocabulary_with_info, f)
-    print(f"\n   ✓ Saved vocabulary to {OUTPUT_VOCABULARY}")
-    
-    del label_model, label_tokenizer
-    clear_gpu_memory([1])
+    return None
 
-    # ---------------------------------------------------------
-    # STEP 4: PREPARE FACILITY PROMPTS WITH ROBUST OUTPUT STRUCTURE
-    # ---------------------------------------------------------
-    print("\n[4/4] Preparing facility prompts with robust output structure...")
-    print(f"   Including up to {N_REVIEWS_PER_CLUSTER} reviews per cluster")
+def extract_json(text: str) -> Optional[Dict[Any, Any]]:
+    """Safe JSON extraction"""
+    if not text:
+        return None
     
-    grouped = df_host.groupby('place_id')
+    try:
+        clean_text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_text)
+    except:
+        try:
+            start = text.find('{')
+            end = text.rfind('}') + 1
+            if start != -1 and end != -1:
+                return json.loads(text[start:end])
+        except:
+            return None
+    return None
+
+def create_meta_prompt(original_prompt: str, n_reviews: int, n_summaries: int) -> str:
+    """
+    Enhance original prompt with meta-review context.
+    The reviews in the prompt are already filtered by relevance threshold.
     
-    # We will now save a structured dictionary instead of just the prompt string
-    facility_prompts = [] 
-    facility_metadata = []
-    skipped = 0
+    Args:
+        original_prompt: Pre-computed prompt with filtered reviews
+        n_reviews: Total number of reviews for this facility
+        n_summaries: Number of summaries to generate
+    """
     
-    highlight_stats = {
-        'total_facilities': 0,
-        'total_highlights': 0,
-        'min_highlights': float('inf'),
-        'max_highlights': 0,
-        'total_reviews_in_prompts': 0,
-        'min_reviews_in_prompt': float('inf'),
-        'max_reviews_in_prompt': 0
+    if n_summaries == 0:
+        return None
+    
+    context_addition = f"""
+
+## META-REVIEW CONTEXT:
+- This facility has {n_reviews:,} reviews
+- The reviews provided have been pre-filtered by relevance threshold
+- Each highlight group contains ALL relevant reviews (no artificial limits)
+- Based on review volume, generate {n_summaries} comprehensive meta-summaries
+
+### Your Task:
+Generate meta-summaries that synthesize insights from the pre-filtered reviews.
+- Create {n_summaries} distinct summaries in English
+- Create {n_summaries} corresponding summaries in Korean
+- Each summary should be 2-4 sentences
+- Focus on different aspects per summary
+- Use natural language (NO bullet points)
+- Reference patterns across multiple reviews
+
+The reviews have been carefully selected and grouped by topic relevance.
+Synthesize this rich context into {n_summaries} high-quality summaries.
+"""
+    
+    return original_prompt + context_addition + "\n\nProvide the output strictly as a JSON object."
+
+def combine_results(facility_obj: Dict, llm_response: Dict) -> Dict:
+    """
+    Combine pre-computed metadata from Part 4 with LLM-generated summaries.
+    
+    Args:
+        facility_obj: Pre-computed data from Part 4 (Facility, Total_Reviews, Key_Highlights)
+        llm_response: LLM response with Summaries and Summaries_Korean
+    
+    Returns:
+        Combined dictionary with ground truth metadata + generated summaries
+    """
+    # Start with pre-computed ground truth from Part 4
+    result = {
+        'Facility': facility_obj['Facility'],
+        'Total_Reviews': facility_obj['Total_Reviews'],
+        'Key_Highlights': facility_obj['Key_Highlights']
     }
     
-    for place_id, group in tqdm(grouped, desc="Facilities"):
-        n_reviews = len(group)
-        n_summaries = calculate_num_summaries(n_reviews)
+    # Add LLM-generated summaries
+    result['Summaries'] = llm_response.get('Summaries', [])
+    result['Summaries_Korean'] = llm_response.get('Summaries_Korean', [])
+    
+    return result
+
+# ==========================================
+# TEST MODE FUNCTION WITH DETAILED OUTPUT
+# ==========================================
+def run_test_mode(client, facility_data):
+    """Run test mode with random samples - showing full pipeline"""
+    print(f"\n{'='*70}")
+    print(f"🧪 TEST MODE - Processing {TEST_SAMPLE_SIZE} Random Samples")
+    print(f"{'='*70}\n")
+    
+    # Randomly sample
+    total_facilities = len(facility_data)
+    random_indices = random.sample(range(total_facilities), TEST_SAMPLE_SIZE)
+    
+    print(f"Selected indices: {random_indices}\n")
+    
+    results = []
+    
+    for i, idx in enumerate(random_indices):
+        print(f"\n{'#'*70}")
+        print(f"SAMPLE {i+1}/{TEST_SAMPLE_SIZE} (Index: {idx})")
+        print(f"{'#'*70}\n")
+        
+        facility_obj = facility_data[idx]
+        
+        # Show original metadata from Part 4
+        print(f"📋 PRE-COMPUTED METADATA (From Part 4):")
+        print(f"{'─'*70}")
+        metadata_preview = {
+            'Facility': facility_obj['Facility'],
+            'Total_Reviews': facility_obj['Total_Reviews'],
+            'n_summaries': facility_obj['n_summaries'],
+            'n_highlights': facility_obj['n_highlights'],
+            'Key_Highlights_Sample': facility_obj['Key_Highlights'][:3] if len(facility_obj['Key_Highlights']) > 3 else facility_obj['Key_Highlights']
+        }
+        print(json.dumps(metadata_preview, indent=2, ensure_ascii=False))
+        print()
+        
+        n_reviews = facility_obj['Total_Reviews']
+        n_summaries = facility_obj['n_summaries']
+        
+        print(f"📊 GENERATION TARGET:")
+        print(f"{'─'*70}")
+        print(f"   Total Reviews: {n_reviews:,}")
+        print(f"   Target Summaries: {n_summaries}")
+        print()
         
         if n_summaries == 0:
-            skipped += 1
+            print(f"   ⚠️ Skipping - insufficient reviews (<10)\n")
             continue
         
-        min_relevance = calculate_min_relevance_threshold(n_reviews)
-        max_highlights = calculate_max_highlights(n_reviews)
+        # CLEAN THE PROMPT - Remove cluster references
+        original_prompt = facility_obj['prompt']
+        cleaned_prompt = clean_cluster_references(original_prompt)
         
-        counts = group['cluster_id'].value_counts()
-        total = len(group)
+        # Show cleaning stats
+        removed_chars = len(original_prompt) - len(cleaned_prompt)
+        print(f"🧹 PROMPT CLEANING:")
+        print(f"{'─'*70}")
+        print(f"   Original length: {len(original_prompt):,} chars")
+        print(f"   Cleaned length: {len(cleaned_prompt):,} chars")
+        print(f"   Removed: {removed_chars:,} chars ({removed_chars/len(original_prompt)*100:.1f}%)")
+        print()
         
-        highlights = []
-        for cid, count in counts.items():
-            relevance = count / total
+        # Show cleaned prompt preview
+        print(f"📝 CLEANED PROMPT (pre-filtered reviews):")
+        print(f"{'─'*70}")
+        prompt_preview = cleaned_prompt[:800] if len(cleaned_prompt) > 800 else cleaned_prompt
+        print(prompt_preview + "..." if len(cleaned_prompt) > 800 else prompt_preview)
+        print()
+        
+        # Create meta-prompt with CLEANED prompt
+        meta_prompt = create_meta_prompt(cleaned_prompt, n_reviews, n_summaries)
+        
+        if not meta_prompt:
+            print(f"   ⚠️ Skipped due to insufficient reviews\n")
+            continue
+        
+        print(f"🔧 META-ENHANCED PROMPT (sent to API):")
+        print(f"{'─'*70}")
+        # Show last part with meta context
+        print("..." + meta_prompt[-600:])
+        print()
+        
+        # Generate
+        print(f"🚀 Sending to {MODEL_NAME}...")
+        output = generate_with_retry(client, meta_prompt)
+        
+        if output:
+            print(f"✅ Received response\n")
             
-            if relevance >= min_relevance or len(highlights) < n_summaries:
-                labels = cluster_vocabulary.get(cid, {"en": "General medical service", "ko": "일반 의료 서비스"})
-                highlights.append({
-                    'cid': cid,
-                    'en': labels['en'],
-                    'ko': labels['ko'],
-                    'relevance': relevance,
-                    'count': count
-                })
+            print(f"📤 RAW API RESPONSE:")
+            print(f"{'─'*70}")
+            print(output[:1000] + "..." if len(output) > 1000 else output)
+            print()
             
-            if len(highlights) >= max_highlights:
-                break
+            json_data = extract_json(output)
+            if json_data:
+                # COMBINE: Pre-computed metadata + LLM summaries
+                combined_result = combine_results(facility_obj, json_data)
+                results.append(combined_result)
+                
+                print(f"✨ COMBINED FINAL RESULT:")
+                print(f"{'─'*70}")
+                print(json.dumps(combined_result, indent=2, ensure_ascii=False))
+                print()
+                
+                # Show key stats
+                print(f"📊 RESULT COMPOSITION:")
+                print(f"{'─'*70}")
+                print(f"   FROM PART 4 (Ground Truth):")
+                print(f"      - Facility: {combined_result['Facility']}")
+                print(f"      - Total_Reviews: {combined_result['Total_Reviews']}")
+                print(f"      - Key_Highlights: {len(combined_result['Key_Highlights'])} items")
+                print(f"\n   FROM LLM (Generated):")
+                print(f"      - Summaries (EN): {len(combined_result['Summaries'])}")
+                print(f"      - Summaries (KO): {len(combined_result['Summaries_Korean'])}")
+                
+                if combined_result.get('Key_Highlights'):
+                    print(f"\n   Sample Highlights (from Part 4):")
+                    for j, highlight in enumerate(combined_result['Key_Highlights'][:3], 1):
+                        print(f"      {j}. EN: {highlight['topic_en']}")
+                        print(f"         KO: {highlight['topic_ko']}")
+                        print(f"         Relevance: {highlight['relevance']:.1%}")
+                
+                if combined_result.get('Summaries'):
+                    print(f"\n   Sample Summary (EN, from LLM):")
+                    print(f"      {combined_result['Summaries'][0][:200]}...")
+                
+                print()
+            else:
+                print(f"   ❌ Failed to extract JSON from output\n")
+        else:
+            print(f"   ❌ Failed to generate output\n")
         
-        highlights.sort(key=lambda x: x['relevance'], reverse=True)
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+    
+    # Final Summary
+    print(f"\n{'='*70}")
+    print(f"📊 TEST MODE SUMMARY")
+    print(f"{'='*70}")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Temperature: {TEMPERATURE}")
+    print(f"Samples Processed: {TEST_SAMPLE_SIZE}")
+    print(f"Successful: {len(results)}/{TEST_SAMPLE_SIZE}")
+    print(f"Success Rate: {len(results)/TEST_SAMPLE_SIZE*100:.1f}%")
+    
+    if results:
+        avg_highlights = sum(len(r.get('Key_Highlights', [])) for r in results) / len(results)
+        avg_summaries_en = sum(len(r.get('Summaries', [])) for r in results) / len(results)
+        avg_summaries_ko = sum(len(r.get('Summaries_Korean', [])) for r in results) / len(results)
         
-        highlight_stats['total_facilities'] += 1
-        highlight_stats['total_highlights'] += len(highlights)
-        highlight_stats['min_highlights'] = min(highlight_stats['min_highlights'], len(highlights))
-        highlight_stats['max_highlights'] = max(highlight_stats['max_highlights'], len(highlights))
+        print(f"\nAverage Metrics:")
+        print(f"   Key_Highlights per facility: {avg_highlights:.1f} (from Part 4)")
+        print(f"   Summaries (EN) per facility: {avg_summaries_en:.1f} (from LLM)")
+        print(f"   Summaries (KO) per facility: {avg_summaries_ko:.1f} (from LLM)")
+    
+    print(f"\n💡 Output Structure:")
+    print(f"   ✓ Facility, Total_Reviews, Key_Highlights: Ground truth from Part 4")
+    print(f"   ✓ Summaries, Summaries_Korean: Generated by LLM")
+    print(f"   ✓ Reduces hallucination risk on metadata")
+    print(f"{'='*70}\n")
+    
+    return results
+
+# ==========================================
+# PRODUCTION MODE FUNCTION
+# ==========================================
+def run_production_mode(client, facility_data):
+    """Run full production mode with meta-review generation"""
+    print(f"\n{'='*70}")
+    print(f"🚀 PRODUCTION MODE - Processing All {len(facility_data):,} Facilities")
+    print(f"{'='*70}\n")
+    
+    state = GenerationState(STATE_FILE)
+    
+    # Resume Logic
+    if os.path.exists(OUTPUT_FILE) and state.state['last_batch_idx'] > 0:
+        print(f"   📂 Resuming from batch {state.state['last_batch_idx']}...")
+        existing_df = pd.read_parquet(OUTPUT_FILE)
+        final_results = existing_df.to_dict('records')
+        start_idx = state.state['last_batch_idx'] * BATCH_SIZE
+    else:
+        print(f"   🆕 Starting fresh...")
+        final_results = []
+        start_idx = 0
+
+    # Processing Loop
+    print(f"\n[2/4] Processing {len(facility_data) - start_idx} remaining facilities...")
+    
+    api_calls = state.state.get('api_calls', 0)
+    failed_calls = state.state.get('failed_calls', 0)
+    batch_number = state.state['last_batch_idx']
+    
+    for i in tqdm(range(start_idx, len(facility_data), BATCH_SIZE), desc="Batches"):
+        batch_number += 1
+        batch_data = facility_data[i:i+BATCH_SIZE]
         
-        highlights_text = []
-        for h in highlights:
-            highlights_text.append(
-                f"- {h['en']} / {h['ko']} ({h['relevance']:.1%}) [{h['count']} reviews]"
+        # Process batch
+        for facility_obj in batch_data:
+            # CLEAN THE PROMPT - Remove cluster references
+            cleaned_prompt = clean_cluster_references(facility_obj['prompt'])
+            
+            # Get metadata
+            n_reviews = facility_obj['Total_Reviews']
+            n_summaries = facility_obj['n_summaries']
+            
+            # Create meta-prompt with CLEANED prompt (will return None if < 10 reviews)
+            meta_prompt = create_meta_prompt(cleaned_prompt, n_reviews, n_summaries)
+            
+            if not meta_prompt:
+                # Skip facilities with too few reviews
+                api_calls += 1
+                failed_calls += 1
+                continue
+            
+            # Generate
+            output = generate_with_retry(client, meta_prompt)
+            api_calls += 1
+            
+            if output:
+                json_data = extract_json(output)
+                if json_data:
+                    # COMBINE: Pre-computed metadata + LLM summaries
+                    combined_result = combine_results(facility_obj, json_data)
+                    final_results.append(combined_result)
+                else:
+                    failed_calls += 1
+            else:
+                failed_calls += 1
+            
+            time.sleep(DELAY_BETWEEN_REQUESTS)
+
+        # Checkpoint
+        if batch_number % CHECKPOINT_EVERY_N_BATCHES == 0 or (i + BATCH_SIZE >= len(facility_data)):
+            if final_results:
+                pd.DataFrame(final_results).to_parquet(OUTPUT_FILE)
+            
+            state.save_state(
+                batch_idx=batch_number,
+                facilities_processed=i + len(batch_data),
+                total_facilities=len(facility_data),
+                records_saved=len(final_results),
+                api_calls=api_calls,
+                failed_calls=failed_calls
             )
-        
-        # Get FULL review text
-        cluster_reviews_full = []
-        total_reviews_included = 0
-        
-        for h in highlights:
-            # Get reviews for this cluster at this facility, sorted by facility_cluster_rank
-            cluster_reviews = group[group['cluster_id'] == h['cid']].nsmallest(
-                N_REVIEWS_PER_CLUSTER, 
-                'facility_cluster_rank'
-            )
             
-            # Format with cluster label and rank
-            for idx, row in cluster_reviews.iterrows():
-                review_entry = f"""
-[Cluster: {h['en']}]
-[Rank: {int(row['facility_cluster_rank'])}/{int(row['facility_cluster_size'])}]
-[Similarity: {row['centroid_similarity']:.3f}]
-Review: {row['review_text']}
-"""
-                cluster_reviews_full.append(review_entry)
-                total_reviews_included += 1
-        
-        highlight_stats['total_reviews_in_prompts'] += total_reviews_included
-        highlight_stats['min_reviews_in_prompt'] = min(
-            highlight_stats['min_reviews_in_prompt'], 
-            total_reviews_included
-        )
-        highlight_stats['max_reviews_in_prompt'] = max(
-            highlight_stats['max_reviews_in_prompt'], 
-            total_reviews_included
-        )
-        
-        reviews_section = "\n".join(cluster_reviews_full)
-        
-        # Prepare the input data we want to force into the output
-        # We will keep this separate so the API/Part 5 script can insert it
-        input_data_json = {
-            "Facility": str(place_id),
-            "Total_Reviews": int(n_reviews),
-            "Key_Highlights": [
-                {
-                    "topic_en": h['en'],
-                    "topic_ko": h['ko'],
-                    "relevance": round(h['relevance'], 3)
-                } for h in highlights
-            ]
-        }
-        
-        input_data_str = json.dumps(input_data_json, indent=4, ensure_ascii=False)
-        
-        prompt = f"""MEDICAL FACILITY COMPREHENSIVE ANALYSIS
+            print(f"\n   💾 Checkpoint #{batch_number // CHECKPOINT_EVERY_N_BATCHES}:")
+            print(f"      Processed: {i + len(batch_data):,}/{len(facility_data):,}")
+            print(f"      Saved: {len(final_results):,}")
+            print(f"      Success Rate: {state.state['success_rate']:.1f}%")
 
-FACILITY: {place_id}
-TOTAL REVIEWS: {n_reviews}
-REVIEWS INCLUDED IN THIS PROMPT: {total_reviews_included}
-MINIMUM RELEVANCE THRESHOLD: {min_relevance:.1%}
-
-ALL IDENTIFIED TOPICS (English / Korean / Relevance / Count):
-{chr(10).join(highlights_text)}
-
-FULL REPRESENTATIVE REVIEWS (closest to cluster centroids for each topic):
-{reviews_section}
-
-TASK:
-1. Review ALL {len(highlights)} topics listed above.
-2. Carefully read through the {total_reviews_included} full reviews provided.
-3. Generate {n_summaries} comprehensive summary sentences focusing on the MOST IMPORTANT aspects.
-4. You MUST retain the exact 'Key_Highlights' and facility details provided in the input.
-
-Each summary should:
-- Address distinct aspects of patient experience
-- Be detailed and specific (20-40 words)
-- Reflect actual patient feedback from the reviews provided
-- Capture the essence of what patients appreciate or criticize
-
-OUTPUT FORMAT:
-Return a JSON object. 
-The fields "Facility", "Total_Reviews", and "Key_Highlights" MUST MATCH EXACTLY the data provided below.
-You must only generate the "Summaries" and "Summaries_Korean" fields based on your analysis.
-
-INPUT DATA (COPY THIS EXACTLY):
-{input_data_str}
-
-REQUIRED OUTPUT JSON STRUCTURE:
-{{
-    "Facility": "{place_id}",
-    "Total_Reviews": {n_reviews},
-    "Key_Highlights": [ ... exactly as provided above ... ],
-    "Summaries": [
-        "Detailed English summary 1...",
-        ... ({n_summaries} summaries total)
-    ],
-    "Summaries_Korean": [
-        "상세한 한국어 요약 1...",
-        ... ({n_summaries} summaries total)
-    ]
-}}"""
-        
-        # SAVE BOTH THE PROMPT AND THE DETERMINISTIC DATA
-        # This allows the next script to use 'input_data' as the ground truth
-        # and only extract 'Summaries' from the LLM response.
-        facility_prompts.append({
-            'prompt_text': prompt,
-            'input_data': input_data_json,
-            'place_id': place_id
-        })
-        
-        facility_metadata.append({
-            'place_id': place_id,
-            'n_reviews': n_reviews,
-            'n_reviews_in_prompt': total_reviews_included,
-            'n_summaries': n_summaries,
-            'n_highlights': len(highlights),
-            'min_relevance': min_relevance
-        })
+    # Final Save
+    print(f"\n[3/4] Saving final output...")
+    if final_results:
+        pd.DataFrame(final_results).to_parquet(OUTPUT_FILE)
+        print(f"   ✅ Saved {len(final_results)} records to {OUTPUT_FILE}")
     
-    print(f"   ✓ Prepared {len(facility_prompts):,} prompts (skipped {skipped})")
+    print(f"\n{'='*70}")
+    print(f"📊 FINAL STATS")
+    print(f"{'='*70}")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Temperature: {TEMPERATURE}")
+    print(f"Total API Calls: {api_calls}")
+    print(f"Success Rate: {(len(final_results)/api_calls*100) if api_calls > 0 else 0:.1f}%")
+    print(f"\n💡 Output Structure:")
+    print(f"   ✓ Metadata from Part 4: Facility, Total_Reviews, Key_Highlights")
+    print(f"   ✓ Generated by LLM: Summaries, Summaries_Korean")
+    print(f"{'='*70}")
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+def main():
+    print("="*70)
+    print("Seoul Medical Meta-Reviews - Qwen 3 32B API")
+    print("Uses pre-computed metadata + LLM summaries")
+    print("Reduces hallucination risk on metadata")
+    print(f"Mode: {'🧪 TEST' if TEST_MODE else '🚀 PRODUCTION'}")
+    print("="*70)
     
-    # Save prompts and metadata
-    with open(OUTPUT_PROMPTS, 'wb') as f:
-        pickle.dump(facility_prompts, f)
+    # Load Data
+    print(f"\n[1/4] Loading prepared data from Part 4...")
+    if not os.path.exists(INPUT_PROMPTS):
+        print(f"❌ File not found: {INPUT_PROMPTS}")
+        return
+
+    with open(INPUT_PROMPTS, 'rb') as f:
+        facility_data = pickle.load(f)
     
-    with open(OUTPUT_METADATA, 'wb') as f:
-        pickle.dump(facility_metadata, f)
+    print(f"   ✓ Loaded {len(facility_data):,} facility objects")
+    print(f"   ✓ Each contains: prompt, Facility, Total_Reviews, Key_Highlights, metadata")
     
-    print(f"   ✓ Saved prompts to {OUTPUT_PROMPTS}")
-    print(f"   ✓ Saved metadata to {OUTPUT_METADATA}")
+    # Setup Client
+    try:
+        client = setup_api_client()
+    except ValueError as e:
+        print(f"❌ {e}")
+        return
     
-    # Statistics
-    print(f"\n📊 Highlights Statistics:")
-    print(f"   Average highlights per facility: {highlight_stats['total_highlights'] / highlight_stats['total_facilities']:.1f}")
-    print(f"   Range: {highlight_stats['min_highlights']} - {highlight_stats['max_highlights']}")
-    
-    print(f"\n📊 Reviews in Prompts Statistics:")
-    print(f"   Total reviews included: {highlight_stats['total_reviews_in_prompts']:,}")
-    print(f"   Average per facility: {highlight_stats['total_reviews_in_prompts'] / highlight_stats['total_facilities']:.1f}")
-    print(f"   Range: {highlight_stats['min_reviews_in_prompt']} - {highlight_stats['max_reviews_in_prompt']}")
-    
-    print(f"\n" + "="*70)
-    print(f"✅ Part 1-4 Complete!")
-    print(f"="*70)
-    print(f"   Clustering Method: {CLUSTERING_METHOD.upper()}")
-    print(f"   Number of Clusters: {N_GLOBAL_CLUSTERS}")
-    print(f"   Representatives: CLOSEST + Percentiles {REPRESENTATIVE_PERCENTILES}")
-    print(f"   Total representatives per cluster: {1 + len(REPRESENTATIVE_PERCENTILES)}")
-    print(f"   Reviews per cluster in facility prompts: up to {N_REVIEWS_PER_CLUSTER}")
-    print(f"   Global + Facility-specific rankings")
-    print(f"   Ready for Part 5 (Summary Generation)")
-    print(f"   Run clustering_part5.py to continue")
-    print(f"="*70)
+    # Run appropriate mode
+    if TEST_MODE:
+        run_test_mode(client, facility_data)
+    else:
+        run_production_mode(client, facility_data)
 
 if __name__ == "__main__":
     main()

@@ -34,7 +34,6 @@ INPUT_METADATA = "../../../seoul-medical-facilities/seoul_medical_reviews_with_e
 OUTPUT_CLUSTERS = "../../../seoul-medical-facilities/seoul_medical_cluster_labels.parquet"
 OUTPUT_VOCABULARY = "../../../seoul-medical-facilities/seoul_medical_cluster_vocabulary.pkl"
 OUTPUT_PROMPTS = "../../../seoul-medical-facilities/seoul_medical_facility_prompts.pkl"
-OUTPUT_METADATA = "../../../seoul-medical-facilities/seoul_medical_facility_metadata.pkl"
 
 LABEL_LLM_ID = "Qwen/Qwen2.5-14B-Instruct"
 
@@ -597,13 +596,12 @@ EXAMPLE OUTPUT:
     clear_gpu_memory([1])
 
     # ---------------------------------------------------------
-    # STEP 4: PREPARE FACILITY PROMPTS
+    # STEP 4: PREPARE FACILITY PROMPTS (MODIFIED)
     # ---------------------------------------------------------
     print("\n[4/4] Preparing facility prompts...")
     grouped = df_host.groupby('place_id')
     
-    facility_prompts = []
-    facility_metadata = []
+    facility_data = []  # Changed from separate prompts and metadata lists
     skipped = 0
     
     highlight_stats = {
@@ -634,11 +632,11 @@ EXAMPLE OUTPUT:
             if relevance >= min_relevance or len(highlights) < n_summaries:
                 labels = cluster_vocabulary.get(cid, {"en": "General medical service", "ko": "일반 의료 서비스"})
                 highlights.append({
-                    'cid': cid,
-                    'en': labels['en'],
-                    'ko': labels['ko'],
-                    'relevance': relevance,
-                    'count': count
+                    'cluster_id': int(cid),
+                    'topic_en': labels['en'],
+                    'topic_ko': labels['ko'],
+                    'relevance': float(relevance),
+                    'count': int(count)
                 })
             
             if len(highlights) >= max_highlights:
@@ -654,27 +652,24 @@ EXAMPLE OUTPUT:
         highlights_text = []
         for h in highlights:
             highlights_text.append(
-                f"- {h['en']} / {h['ko']} ({h['relevance']:.1%}) [{h['count']} reviews]"
+                f"- {h['topic_en']} / {h['topic_ko']} ({h['relevance']:.1%}) [{h['count']} reviews]"
             )
         
         # Use facility_cluster_rank to get most representative reviews
         samples = []
         for h in highlights[:n_summaries + 5]:
             # Get top 2 most representative reviews (lowest facility_cluster_rank) for this cluster
-            cluster_reviews = group[group['cluster_id'] == h['cid']].nsmallest(2, 'facility_cluster_rank')
+            cluster_reviews = group[group['cluster_id'] == h['cluster_id']].nsmallest(2, 'facility_cluster_rank')
             sample_texts = cluster_reviews['review_text'].tolist()
             
-            # --- MODIFIED TRUNCATION LOGIC ---
+            # Truncation logic
             for txt in sample_texts:
                 if TRUNCATE_REVIEWS:
-                    # Original behavior: Cut and add "..."
                     review_content = f"{txt[:TRUNCATION_LENGTH]}..."
                 else:
-                    # New behavior: Use full text
                     review_content = txt
                     
-                samples.append(f"({h['en']}): {review_content}")
-            # ---------------------------------
+                samples.append(f"({h['topic_en']}): {review_content}")
         
         prompt = f"""MEDICAL FACILITY COMPREHENSIVE ANALYSIS
 
@@ -703,7 +698,7 @@ OUTPUT FORMAT (JSON only):
     "Facility": "{place_id}",
     "Total_Reviews": {n_reviews},
     "Key_Highlights": [
-        {{"topic_en": "{highlights[0]['en']}", "topic_ko": "{highlights[0]['ko']}", "relevance": {highlights[0]['relevance']:.3f}}},
+        {{"topic_en": "{highlights[0]['topic_en']}", "topic_ko": "{highlights[0]['topic_ko']}", "relevance": {highlights[0]['relevance']:.3f}}},
         ... (include ALL {len(highlights)} topics with exact relevance values)
     ],
     "Summaries": [
@@ -716,26 +711,27 @@ OUTPUT FORMAT (JSON only):
     ]
 }}"""
         
-        facility_prompts.append(prompt)
-        facility_metadata.append({
-            'place_id': place_id,
-            'n_reviews': n_reviews,
+        # Create combined data object
+        facility_obj = {
+            'prompt': prompt,
+            'Facility': place_id,
+            'Total_Reviews': n_reviews,
+            'Key_Highlights': highlights,
             'n_summaries': n_summaries,
             'n_highlights': len(highlights),
-            'min_relevance': min_relevance
-        })
+            'min_relevance': min_relevance,
+            'max_highlights': max_highlights
+        }
+        
+        facility_data.append(facility_obj)
     
-    print(f"   ✓ Prepared {len(facility_prompts):,} prompts (skipped {skipped})")
+    print(f"   ✓ Prepared {len(facility_data):,} facility objects (skipped {skipped})")
     
-    # Save prompts and metadata
+    # Save combined facility data
     with open(OUTPUT_PROMPTS, 'wb') as f:
-        pickle.dump(facility_prompts, f)
+        pickle.dump(facility_data, f)
     
-    with open(OUTPUT_METADATA, 'wb') as f:
-        pickle.dump(facility_metadata, f)
-    
-    print(f"   ✓ Saved prompts to {OUTPUT_PROMPTS}")
-    print(f"   ✓ Saved metadata to {OUTPUT_METADATA}")
+    print(f"   ✓ Saved facility data to {OUTPUT_PROMPTS}")
     
     # Statistics
     print(f"\n📊 Highlights Statistics:")
@@ -750,6 +746,7 @@ OUTPUT FORMAT (JSON only):
     print(f"   Representatives: CLOSEST + Percentiles {REPRESENTATIVE_PERCENTILES}")
     print(f"   Total representatives per cluster: {1 + len(REPRESENTATIVE_PERCENTILES)}")
     print(f"   Global + Facility-specific rankings")
+    print(f"   Facility data structure: prompt + metadata in single object")
     print(f"   Ready for Part 5 (Summary Generation)")
     print(f"   Run clustering_part5.py to continue")
     print(f"="*70)
