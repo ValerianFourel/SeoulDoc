@@ -4,3 +4,4 @@
 **/*.parquet
 **/*.csv
 **/*.json
+**/*.txt
