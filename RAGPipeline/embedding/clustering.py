@@ -5,6 +5,7 @@ Enhanced with percentile-based cluster labeling
 WITH PROXIMITY ORDERING: Reviews ranked by distance to cluster centroid
 Global cluster ranking + facility-specific cluster ranking
 INCLUDING CLOSEST REVIEW TO CENTROID
+SENDS 5 FULL REVIEWS PER CLUSTER-FACILITY PAIR (NO TRUNCATION)
 """
 
 import cupy as cp
@@ -51,13 +52,10 @@ REPRESENTATIVE_PERCENTILES = [10, 20, 30, 50, 90]  # 5 reviews at different dist
 # Total: 6 reviews (1 closest + 5 at percentiles)
 
 # ==========================================
-# TRUNCATION FLAGS (MODIFIED)
+# REVIEWS PER CLUSTER-FACILITY PAIR
 # ==========================================
-# Set to True to cut reviews to save context, False to keep full text
-TRUNCATE_REVIEWS = False 
-
-# Length to cut at if TRUNCATE_REVIEWS is True
-TRUNCATION_LENGTH = 120
+# Number of FULL reviews to include per cluster for each facility
+REVIEWS_PER_CLUSTER = 5  # ALWAYS FULL TEXT, NEVER TRUNCATED
 
 # ==========================================
 # ADAPTIVE CALCULATORS
@@ -211,7 +209,7 @@ def main():
     print(f"Clusters: {N_GLOBAL_CLUSTERS}")
     print(f"Method: {CLUSTERING_METHOD.upper()}")
     print(f"Representatives: CLOSEST + Percentiles {REPRESENTATIVE_PERCENTILES}")
-    print(f"TRUNCATE REVIEWS: {TRUNCATE_REVIEWS} (Len: {TRUNCATION_LENGTH if TRUNCATE_REVIEWS else 'FULL'})")
+    print(f"Reviews per cluster-facility: {REVIEWS_PER_CLUSTER} FULL REVIEWS (NO TRUNCATION)")
     print("="*70)
     
     # ---------------------------------------------------------
@@ -596,12 +594,13 @@ EXAMPLE OUTPUT:
     clear_gpu_memory([1])
 
     # ---------------------------------------------------------
-    # STEP 4: PREPARE FACILITY PROMPTS (MODIFIED)
+    # STEP 4: PREPARE FACILITY PROMPTS (MODIFIED FOR 5 FULL REVIEWS)
     # ---------------------------------------------------------
     print("\n[4/4] Preparing facility prompts...")
+    print(f"   Using {REVIEWS_PER_CLUSTER} FULL reviews per cluster-facility pair")
     grouped = df_host.groupby('place_id')
     
-    facility_data = []  # Changed from separate prompts and metadata lists
+    facility_data = []
     skipped = 0
     
     highlight_stats = {
@@ -655,21 +654,23 @@ EXAMPLE OUTPUT:
                 f"- {h['topic_en']} / {h['topic_ko']} ({h['relevance']:.1%}) [{h['count']} reviews]"
             )
         
+        # ===================================================================
+        # MODIFIED: Get REVIEWS_PER_CLUSTER (5) FULL reviews per cluster
         # Use facility_cluster_rank to get most representative reviews
+        # NO TRUNCATION - ALWAYS FULL TEXT
+        # ===================================================================
         samples = []
         for h in highlights[:n_summaries + 5]:
-            # Get top 2 most representative reviews (lowest facility_cluster_rank) for this cluster
-            cluster_reviews = group[group['cluster_id'] == h['cluster_id']].nsmallest(2, 'facility_cluster_rank')
+            # Get top REVIEWS_PER_CLUSTER (5) most representative reviews for this cluster
+            cluster_reviews = group[group['cluster_id'] == h['cluster_id']].nsmallest(
+                REVIEWS_PER_CLUSTER, 
+                'facility_cluster_rank'
+            )
             sample_texts = cluster_reviews['review_text'].tolist()
             
-            # Truncation logic
+            # Add ALL reviews in FULL (NO TRUNCATION)
             for txt in sample_texts:
-                if TRUNCATE_REVIEWS:
-                    review_content = f"{txt[:TRUNCATION_LENGTH]}..."
-                else:
-                    review_content = txt
-                    
-                samples.append(f"({h['topic_en']}): {review_content}")
+                samples.append(f"({h['topic_en']}): {txt}")
         
         prompt = f"""MEDICAL FACILITY COMPREHENSIVE ANALYSIS
 
@@ -681,7 +682,8 @@ ALL IDENTIFIED TOPICS (English / Korean / Relevance / Count):
 {chr(10).join(highlights_text)}
 
 REPRESENTATIVE REVIEW SAMPLES (most similar to cluster centroids):
-{chr(10).join(samples[:20])}
+Each cluster shows up to {REVIEWS_PER_CLUSTER} FULL reviews (complete text, no truncation):
+{chr(10).join(samples[:50])}
 
 TASK:
 1. Review ALL {len(highlights)} topics listed above
@@ -746,6 +748,7 @@ OUTPUT FORMAT (JSON only):
     print(f"   Representatives: CLOSEST + Percentiles {REPRESENTATIVE_PERCENTILES}")
     print(f"   Total representatives per cluster: {1 + len(REPRESENTATIVE_PERCENTILES)}")
     print(f"   Global + Facility-specific rankings")
+    print(f"   Reviews per cluster-facility: {REVIEWS_PER_CLUSTER} FULL REVIEWS (NO TRUNCATION)")
     print(f"   Facility data structure: prompt + metadata in single object")
     print(f"   Ready for Part 5 (Summary Generation)")
     print(f"   Run clustering_part5.py to continue")
