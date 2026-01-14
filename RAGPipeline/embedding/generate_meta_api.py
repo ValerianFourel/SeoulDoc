@@ -23,6 +23,7 @@ import re
 INPUT_PROMPTS = "../../../seoul-medical-facilities/seoul_medical_facility_prompts.pkl"
 OUTPUT_FILE = "../../../seoul-medical-facilities/seoul_medical_rag_knowledge.parquet"
 STATE_FILE = "../../../seoul-medical-facilities/generation_state_qwen3.json"
+TEST_MODE_OUTPUT = "../../../seoul-medical-facilities/test_mode_results_qwen3.json"
 
 # API Configuration
 API_BASE_URL = "https://api.deepinfra.com/v1/openai" 
@@ -30,7 +31,7 @@ API_KEY = os.environ.get("QWEN_API_KEY")
 MODEL_NAME = "Qwen/Qwen3-32B"
 
 # MODE SELECTION
-TEST_MODE = True  # Set to False for full production run
+TEST_MODE = False  # Set to False for full production run
 TEST_SAMPLE_SIZE = 5
 
 # Test mode settings
@@ -468,6 +469,37 @@ def run_test_mode(client, facility_data):
     print(f"   ✓ Full prompts always sent to API (never truncated)")
     print(f"{'='*70}\n")
     
+    # 🆕 SAVE RESULTS TO JSON
+    if results:
+        try:
+            # Create output structure with metadata
+            test_output = {
+                'metadata': {
+                    'timestamp': datetime.now().isoformat(),
+                    'model': MODEL_NAME,
+                    'temperature': TEMPERATURE,
+                    'samples_processed': TEST_SAMPLE_SIZE,
+                    'successful': len(results),
+                    'success_rate': len(results)/TEST_SAMPLE_SIZE*100,
+                    'random_indices': random_indices
+                },
+                'results': results,
+                'statistics': {
+                    'avg_highlights_per_facility': avg_highlights if results else 0,
+                    'avg_summaries_en_per_facility': avg_summaries_en if results else 0,
+                    'avg_summaries_ko_per_facility': avg_summaries_ko if results else 0
+                }
+            }
+            
+            with open(TEST_MODE_OUTPUT, 'w', encoding='utf-8') as f:
+                json.dump(test_output, f, indent=2, ensure_ascii=False)
+            
+            print(f"💾 Test results saved to: {TEST_MODE_OUTPUT}")
+            print(f"   File size: {os.path.getsize(TEST_MODE_OUTPUT) / 1024:.1f} KB")
+            print()
+        except Exception as e:
+            print(f"⚠️ Failed to save test results to JSON: {e}")
+    
     return results
 
 # ==========================================
@@ -591,6 +623,7 @@ def main():
     if TEST_MODE:
         print(f"Print Full Prompt: {'YES' if PRINT_FULL_PROMPT else 'NO (preview only)'}")
         print(f"Print Full Output: {'YES' if PRINT_FULL_OUTPUT else 'NO (preview only)'}")
+        print(f"Test Results Output: {TEST_MODE_OUTPUT}")
     print("="*70)
     
     # Load Data
