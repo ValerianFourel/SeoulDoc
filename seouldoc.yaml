@@ -8,7 +8,7 @@ dependencies:
   - _libgcc_mutex=0.1
   - _openmp_mutex=4.5
   - _python_abi3_support=1.0
-  - accelerate=1.12.0
+  - accelerate=0.32.1
   - aiohappyeyeballs=2.6.1
   - aiohttp=3.13.3
   - aiosignal=1.4.0
@@ -319,14 +319,14 @@ dependencies:
   - tblib=3.2.2
   - threadpoolctl=3.6.0
   - tk=8.6.13
-  - tokenizers=0.22.2
+  - tokenizers=0.19.1
   - toolz=1.1.0
   - torchaudio=2.4.1
   - torchtriton=3.0.0
   - torchvision=0.19.1
   - tornado=6.5.4
   - tqdm=4.67.1
-  - transformers=4.56.1
+  - transformers=4.44.1
   - treelite=3.9.1
   - typing-extensions=4.15.0
   - typing-inspection=0.4.2
