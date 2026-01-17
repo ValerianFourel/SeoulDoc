@@ -1,13 +1,14 @@
 """
-Seoul Medical Reviews - Part 5: Meta Summary Generation via API (Qwen 3)
-========================================================================
+Seoul Medical Reviews - Part 5: Meta Summary Generation via API (Groq Qwen)
+===========================================================================
 Uses pre-computed prompts with reviews already filtered by relevance threshold.
 SAVES: Pre-computed metadata from Part 4 + LLM-generated summaries only
+ADAPTED FOR: Groq (High Speed Inference)
 """
 
 import json
 import pandas as pd
-from openai import OpenAI
+from groq import Groq  # <--- Changed from openai to groq
 from tqdm import tqdm
 import os
 import pickle
@@ -22,31 +23,35 @@ import re
 # ==========================================
 INPUT_PROMPTS = "../../../seoul-medical-facilities/seoul_medical_facility_prompts.pkl"
 OUTPUT_FILE = "../../../seoul-medical-facilities/seoul_medical_rag_knowledge.parquet"
-STATE_FILE = "../../../seoul-medical-facilities/generation_state_qwen3.json"
-TEST_MODE_OUTPUT = "../../../seoul-medical-facilities/test_mode_results_qwen3.json"
+STATE_FILE = "../../../seoul-medical-facilities/generation_state_qwen_groq.json"
+TEST_MODE_OUTPUT = "../../../seoul-medical-facilities/test_mode_results_qwen_groq.json"
 
 # API Configuration
-API_BASE_URL = "https://api.deepinfra.com/v1/openai" 
-API_KEY = os.environ.get("QWEN_API_KEY")
-MODEL_NAME = "Qwen/Qwen3-32B"
+# Ensure you have 'GROQ_API_KEY' set in your environment variables
+API_KEY = os.environ.get("GROQ_API_KEY") 
+
+# Groq usually uses 'qwen-2.5-32b' for the 32B model. 
+# If a specific 'qwen3' ID exists in your tier, update it here.
+MODEL_NAME = "qwen/qwen3-32b" 
 
 # MODE SELECTION
 TEST_MODE = False  # Set to False for full production run
 TEST_SAMPLE_SIZE = 5
 
 # Test mode settings
-PRINT_FULL_PROMPT = True  # Set to False to only print preview in test mode
-PRINT_FULL_OUTPUT = True  # Set to False to only print preview of API response in test mode
+PRINT_FULL_PROMPT = True 
+PRINT_FULL_OUTPUT = True 
 
-# Performance Settings
+# Performance Settings (Optimized for Groq)
 BATCH_SIZE = 50
-MAX_TOKENS_OUTPUT = 4000  # Increased for meta-summaries
+MAX_TOKENS_OUTPUT = 4096  # Groq supports large context
 TEMPERATURE = 0.6
-MAX_RETRIES = 3
+MAX_RETRIES = 5 # Increased retries for Groq rate limits
 RETRY_DELAY = 2
 
 # Rate limiting
-REQUESTS_PER_MINUTE = 100 
+# Groq is fast. We set this high, but rely on 429 retry logic to throttle if needed.
+REQUESTS_PER_MINUTE = 300 
 DELAY_BETWEEN_REQUESTS = 60 / REQUESTS_PER_MINUTE
 
 # Checkpoint settings
@@ -58,34 +63,18 @@ CHECKPOINT_EVERY_N_BATCHES = 5
 def clean_cluster_references(prompt: str) -> str:
     """
     Remove cluster number references from prompts.
-    Removes patterns like:
-    - 'Medical service cluster 172' / '의료 서비스 클러스터 172'
-    - 'cluster 42' / '클러스터 42'
     """
-    # Remove English cluster references
-    # Pattern: "cluster" followed by optional space and digits
     prompt = re.sub(r'\bcluster\s*\d+\b', '', prompt, flags=re.IGNORECASE)
-    
-    # Remove Korean cluster references
-    # Pattern: "클러스터" followed by optional space and digits
     prompt = re.sub(r'클러스터\s*\d+', '', prompt)
-    
-    # Clean up resulting artifacts:
-    # Multiple spaces to single space
     prompt = re.sub(r'\s{2,}', ' ', prompt)
-    
-    # Space before slash
     prompt = re.sub(r'\s+/', ' /', prompt)
     
-    # Remove lines that become empty or just "Medical service /" or similar
     lines = []
     for line in prompt.split('\n'):
         cleaned = line.strip()
-        # Skip if line is now just "Medical service /" or "의료 서비스 /" or similar artifacts
         if cleaned and not re.match(r'^[A-Za-z\s가-힣]+/\s*$', cleaned):
             lines.append(line)
         elif cleaned and '/' in cleaned and len(cleaned.split('/')[0].strip()) > 3:
-            # Keep lines with actual content before the slash
             lines.append(line)
     
     return '\n'.join(lines)
@@ -101,14 +90,11 @@ class GenerationState:
         self.state = self.load_state()
     
     def load_state(self):
-        """Load existing state or create new"""
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, 'r') as f:
                     state = json.load(f)
-                print(f"   📂 Loaded existing state:")
-                print(f"      Last batch: {state.get('last_batch_idx', 0)}")
-                print(f"      Processed: {state.get('facilities_processed', 0)}")
+                print(f"   📂 Loaded existing state: Batch {state.get('last_batch_idx', 0)}")
                 return state
             except json.JSONDecodeError:
                 print("   ⚠️ State file corrupted. Starting fresh.")
@@ -126,7 +112,6 @@ class GenerationState:
     
     def save_state(self, batch_idx, facilities_processed, total_facilities, 
                    records_saved, api_calls, failed_calls):
-        """Save current state"""
         self.state.update({
             'last_batch_idx': batch_idx,
             'facilities_processed': facilities_processed,
@@ -142,51 +127,63 @@ class GenerationState:
             json.dump(self.state, f, indent=2)
 
 # ==========================================
-# API HELPER FUNCTIONS
+# API HELPER FUNCTIONS (GROQ ADAPTED)
 # ==========================================
 def setup_api_client():
-    """Initialize Standard OpenAI Client pointing to Qwen 3 Provider"""
+    """Initialize Groq Client"""
     if not API_KEY:
-        raise ValueError("API key not found! Set 'QWEN_API_KEY' environment variable.")
+        raise ValueError("API key not found! Set 'GROQ_API_KEY' environment variable.")
     
-    client = OpenAI(
-        api_key=API_KEY,
-        base_url=API_BASE_URL
+    # Initialize Groq client
+    client = Groq(
+        api_key=API_KEY
     )
     
-    print(f"   ✓ OpenAI Client Initialized")
-    print(f"   ✓ Base URL: {API_BASE_URL}")
+    print(f"   ✓ Groq Client Initialized")
     print(f"   ✓ Target Model: {MODEL_NAME}")
     print(f"   ✓ Temperature: {TEMPERATURE}")
     
     return client
 
 def generate_with_retry(client, prompt: str, max_retries: int = MAX_RETRIES) -> Optional[str]:
-    """Generate text with Qwen 3 using OpenAI client"""
+    """Generate text with Groq Qwen"""
+    
+    # Groq requires 'json' in the system prompt for reliable JSON Mode
     system_msg = """You are a helpful assistant. You must output valid JSON only. No markdown, no explanations.
 Reviews are pre-filtered and grouped by relevance. Generate comprehensive meta-summaries from the provided context."""
 
     for attempt in range(max_retries):
         try:
+            # Groq API Call
             response = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=MAX_TOKENS_OUTPUT,
                 temperature=TEMPERATURE,
+                max_completion_tokens=MAX_TOKENS_OUTPUT, # Groq uses max_completion_tokens
                 top_p=0.9,
-                response_format={"type": "json_object"} 
+                response_format={"type": "json_object"}, # Groq supports JSON mode
+                stream=False # We use non-streaming for batch processing to get full JSON
             )
             
             return response.choices[0].message.content
             
         except Exception as e:
             if attempt < max_retries - 1:
+                # Exponential backoff
                 wait_time = RETRY_DELAY * (2 ** attempt)
-                if "429" in str(e):
-                    print(f"\n   ⏳ Rate limit (429). Waiting {wait_time}s...")
+                error_str = str(e)
+                
+                if "429" in error_str:
+                    print(f"\n   ⏳ Groq Rate limit (429). Waiting {wait_time}s...")
+                elif "400" in error_str:
+                    print(f"\n   ⚠️ Bad Request (400) - Context likely too long. Skipping.")
+                    return None # Don't retry context length errors
+                else:
+                    print(f"\n   ⚠️ Error: {error_str[:100]}... Retrying in {wait_time}s")
+                
                 time.sleep(wait_time)
             else:
                 print(f"\n   ❌ Failed after {max_retries} attempts: {str(e)[:100]}")
@@ -213,19 +210,6 @@ def extract_json(text: str) -> Optional[Dict[Any, Any]]:
     return None
 
 def create_meta_prompt(original_prompt: str, n_reviews: int, n_summaries: int) -> str:
-    """
-    Enhance original prompt with meta-review context.
-    The reviews in the prompt are already filtered by relevance threshold.
-    
-    Args:
-        original_prompt: Pre-computed prompt with filtered reviews
-        n_reviews: Total number of reviews for this facility
-        n_summaries: Number of summaries to generate
-    
-    Returns:
-        Full enhanced prompt (NEVER truncated)
-    """
-    
     if n_summaries == 0:
         return None
     
@@ -249,273 +233,83 @@ Generate meta-summaries that synthesize insights from the pre-filtered reviews.
 The reviews have been carefully selected and grouped by topic relevance.
 Synthesize this rich context into {n_summaries} high-quality summaries.
 """
-    
-    # Return FULL prompt (never truncated)
     return original_prompt + context_addition + "\n\nProvide the output strictly as a JSON object."
 
 def combine_results(facility_obj: Dict, llm_response: Dict) -> Dict:
-    """
-    Combine pre-computed metadata from Part 4 with LLM-generated summaries.
-    
-    Args:
-        facility_obj: Pre-computed data from Part 4 (Facility, Total_Reviews, Key_Highlights)
-        llm_response: LLM response with Summaries and Summaries_Korean
-    
-    Returns:
-        Combined dictionary with ground truth metadata + generated summaries
-    """
-    # Start with pre-computed ground truth from Part 4
     result = {
         'Facility': facility_obj['Facility'],
         'Total_Reviews': facility_obj['Total_Reviews'],
         'Key_Highlights': facility_obj['Key_Highlights']
     }
-    
-    # Add LLM-generated summaries
     result['Summaries'] = llm_response.get('Summaries', [])
     result['Summaries_Korean'] = llm_response.get('Summaries_Korean', [])
-    
     return result
 
 # ==========================================
-# TEST MODE FUNCTION WITH DETAILED OUTPUT
+# TEST MODE FUNCTION
 # ==========================================
 def run_test_mode(client, facility_data):
-    """Run test mode with random samples - showing full pipeline"""
     print(f"\n{'='*70}")
-    print(f"🧪 TEST MODE - Processing {TEST_SAMPLE_SIZE} Random Samples")
+    print(f"🧪 TEST MODE (GROQ) - Processing {TEST_SAMPLE_SIZE} Random Samples")
     print(f"{'='*70}\n")
     
-    # Randomly sample
     total_facilities = len(facility_data)
     random_indices = random.sample(range(total_facilities), TEST_SAMPLE_SIZE)
-    
-    print(f"Selected indices: {random_indices}\n")
-    
     results = []
     
     for i, idx in enumerate(random_indices):
         print(f"\n{'#'*70}")
-        print(f"SAMPLE {i+1}/{TEST_SAMPLE_SIZE} (Index: {idx})")
-        print(f"{'#'*70}\n")
+        print(f"SAMPLE {i+1}/{TEST_SAMPLE_SIZE}")
         
         facility_obj = facility_data[idx]
-        
-        # Show original metadata from Part 4
-        print(f"📋 PRE-COMPUTED METADATA (From Part 4):")
-        print(f"{'─'*70}")
-        metadata_preview = {
-            'Facility': facility_obj['Facility'],
-            'Total_Reviews': facility_obj['Total_Reviews'],
-            'n_summaries': facility_obj['n_summaries'],
-            'n_highlights': facility_obj['n_highlights'],
-            'Key_Highlights_Sample': facility_obj['Key_Highlights'][:3] if len(facility_obj['Key_Highlights']) > 3 else facility_obj['Key_Highlights']
-        }
-        print(json.dumps(metadata_preview, indent=2, ensure_ascii=False))
-        print()
-        
-        n_reviews = facility_obj['Total_Reviews']
-        n_summaries = facility_obj['n_summaries']
-        
-        print(f"📊 GENERATION TARGET:")
-        print(f"{'─'*70}")
-        print(f"   Total Reviews: {n_reviews:,}")
-        print(f"   Target Summaries: {n_summaries}")
-        print()
-        
-        if n_summaries == 0:
-            print(f"   ⚠️ Skipping - insufficient reviews (<10)\n")
-            continue
-        
-        # CLEAN THE PROMPT - Remove cluster references
-        original_prompt = facility_obj['prompt']
-        cleaned_prompt = clean_cluster_references(original_prompt)
-        
-        # Show cleaning stats
-        removed_chars = len(original_prompt) - len(cleaned_prompt)
-        print(f"🧹 PROMPT CLEANING:")
-        print(f"{'─'*70}")
-        print(f"   Original length: {len(original_prompt):,} chars")
-        print(f"   Cleaned length: {len(cleaned_prompt):,} chars")
-        print(f"   Removed: {removed_chars:,} chars ({removed_chars/len(original_prompt)*100:.1f}%)")
-        print()
-        
-        # Create meta-prompt with CLEANED prompt
-        meta_prompt = create_meta_prompt(cleaned_prompt, n_reviews, n_summaries)
+        cleaned_prompt = clean_cluster_references(facility_obj['prompt'])
+        meta_prompt = create_meta_prompt(cleaned_prompt, facility_obj['Total_Reviews'], facility_obj['n_summaries'])
         
         if not meta_prompt:
-            print(f"   ⚠️ Skipped due to insufficient reviews\n")
+            print("   ⚠️ Skipped (insufficient reviews)")
             continue
-        
-        # SHOW FULL PROMPT (what will actually be sent to API)
+            
         if PRINT_FULL_PROMPT:
-            print(f"📝 FULL PROMPT SENT TO API:")
-            print(f"{'─'*70}")
-            print(f"[START OF PROMPT]")
-            print(f"{'═'*70}")
-            print(meta_prompt)
-            print(f"{'═'*70}")
-            print(f"[END OF PROMPT]")
-            print(f"\nPrompt Length: {len(meta_prompt):,} characters")
-            print()
-        else:
-            # Show preview only
-            print(f"📝 PROMPT PREVIEW (first 1000 chars):")
-            print(f"{'─'*70}")
-            print(meta_prompt[:1000] + "...")
-            print(f"\n... [MIDDLE SECTION OMITTED] ...\n")
-            print(f"📝 PROMPT PREVIEW (last 600 chars):")
-            print(f"{'─'*70}")
-            print("..." + meta_prompt[-600:])
-            print(f"\nFull Prompt Length: {len(meta_prompt):,} characters")
-            print()
+            print(f"📝 PROMPT SENT TO GROQ ({len(meta_prompt):,} chars)...")
         
-        # Generate (always send FULL prompt)
-        print(f"🚀 Sending FULL prompt to {MODEL_NAME}...")
-        print(f"   Sending {len(meta_prompt):,} characters to API...")
+        start_time = time.time()
         output = generate_with_retry(client, meta_prompt)
+        elapsed = time.time() - start_time
         
         if output:
-            print(f"✅ Received response\n")
-            
-            # PRINT FULL OR PREVIEW OUTPUT BASED ON FLAG
+            print(f"✅ Response received in {elapsed:.2f}s")
             if PRINT_FULL_OUTPUT:
-                print(f"📤 FULL RAW API RESPONSE:")
-                print(f"{'─'*70}")
-                print(f"[START OF RESPONSE]")
-                print(f"{'═'*70}")
-                print(output)
-                print(f"{'═'*70}")
-                print(f"[END OF RESPONSE]")
-                print(f"\nResponse Length: {len(output):,} characters")
-                print()
-            else:
-                # Show preview only
-                print(f"📤 RAW API RESPONSE (preview):")
-                print(f"{'─'*70}")
-                print(output[:1000] + "..." if len(output) > 1000 else output)
-                print(f"\nFull Response Length: {len(output):,} characters")
-                print()
+                print(f"📤 RAW OUTPUT:\n{output}\n")
             
             json_data = extract_json(output)
             if json_data:
-                # COMBINE: Pre-computed metadata + LLM summaries
                 combined_result = combine_results(facility_obj, json_data)
                 results.append(combined_result)
-                
-                print(f"✨ COMBINED FINAL RESULT:")
-                print(f"{'─'*70}")
-                print(json.dumps(combined_result, indent=2, ensure_ascii=False))
-                print()
-                
-                # Show key stats
-                print(f"📊 RESULT COMPOSITION:")
-                print(f"{'─'*70}")
-                print(f"   FROM PART 4 (Ground Truth):")
-                print(f"      - Facility: {combined_result['Facility']}")
-                print(f"      - Total_Reviews: {combined_result['Total_Reviews']}")
-                print(f"      - Key_Highlights: {len(combined_result['Key_Highlights'])} items")
-                print(f"\n   FROM LLM (Generated):")
-                print(f"      - Summaries (EN): {len(combined_result['Summaries'])}")
-                print(f"      - Summaries (KO): {len(combined_result['Summaries_Korean'])}")
-                
-                if combined_result.get('Key_Highlights'):
-                    print(f"\n   Sample Highlights (from Part 4):")
-                    for j, highlight in enumerate(combined_result['Key_Highlights'][:3], 1):
-                        print(f"      {j}. EN: {highlight['topic_en']}")
-                        print(f"         KO: {highlight['topic_ko']}")
-                        print(f"         Relevance: {highlight['relevance']:.1%}")
-                
-                if combined_result.get('Summaries'):
-                    print(f"\n   Sample Summary (EN, from LLM):")
-                    print(f"      {combined_result['Summaries'][0][:200]}...")
-                
-                if combined_result.get('Summaries_Korean'):
-                    print(f"\n   Sample Summary (KO, from LLM):")
-                    print(f"      {combined_result['Summaries_Korean'][0][:200]}...")
-                
-                print()
+                print(f"✨ Parsed JSON successfully")
             else:
-                print(f"   ❌ Failed to extract JSON from output\n")
+                print("❌ JSON Extraction failed")
         else:
-            print(f"   ❌ Failed to generate output\n")
-        
+            print("❌ Generation failed")
+            
         time.sleep(DELAY_BETWEEN_REQUESTS)
-    
-    # Final Summary
-    print(f"\n{'='*70}")
-    print(f"📊 TEST MODE SUMMARY")
-    print(f"{'='*70}")
-    print(f"Model: {MODEL_NAME}")
-    print(f"Temperature: {TEMPERATURE}")
-    print(f"Samples Processed: {TEST_SAMPLE_SIZE}")
-    print(f"Successful: {len(results)}/{TEST_SAMPLE_SIZE}")
-    print(f"Success Rate: {len(results)/TEST_SAMPLE_SIZE*100:.1f}%")
-    
+
+    # Save Test Results
     if results:
-        avg_highlights = sum(len(r.get('Key_Highlights', [])) for r in results) / len(results)
-        avg_summaries_en = sum(len(r.get('Summaries', [])) for r in results) / len(results)
-        avg_summaries_ko = sum(len(r.get('Summaries_Korean', [])) for r in results) / len(results)
-        
-        print(f"\nAverage Metrics:")
-        print(f"   Key_Highlights per facility: {avg_highlights:.1f} (from Part 4)")
-        print(f"   Summaries (EN) per facility: {avg_summaries_en:.1f} (from LLM)")
-        print(f"   Summaries (KO) per facility: {avg_summaries_ko:.1f} (from LLM)")
-    
-    print(f"\n💡 Output Structure:")
-    print(f"   ✓ Facility, Total_Reviews, Key_Highlights: Ground truth from Part 4")
-    print(f"   ✓ Summaries, Summaries_Korean: Generated by LLM")
-    print(f"   ✓ Reduces hallucination risk on metadata")
-    print(f"   ✓ Full prompts always sent to API (never truncated)")
-    print(f"{'='*70}\n")
-    
-    # 🆕 SAVE RESULTS TO JSON
-    if results:
-        try:
-            # Create output structure with metadata
-            test_output = {
-                'metadata': {
-                    'timestamp': datetime.now().isoformat(),
-                    'model': MODEL_NAME,
-                    'temperature': TEMPERATURE,
-                    'samples_processed': TEST_SAMPLE_SIZE,
-                    'successful': len(results),
-                    'success_rate': len(results)/TEST_SAMPLE_SIZE*100,
-                    'random_indices': random_indices
-                },
-                'results': results,
-                'statistics': {
-                    'avg_highlights_per_facility': avg_highlights if results else 0,
-                    'avg_summaries_en_per_facility': avg_summaries_en if results else 0,
-                    'avg_summaries_ko_per_facility': avg_summaries_ko if results else 0
-                }
-            }
-            
-            with open(TEST_MODE_OUTPUT, 'w', encoding='utf-8') as f:
-                json.dump(test_output, f, indent=2, ensure_ascii=False)
-            
-            print(f"💾 Test results saved to: {TEST_MODE_OUTPUT}")
-            print(f"   File size: {os.path.getsize(TEST_MODE_OUTPUT) / 1024:.1f} KB")
-            print()
-        except Exception as e:
-            print(f"⚠️ Failed to save test results to JSON: {e}")
-    
-    return results
+        test_output = {'results': results, 'metadata': {'model': MODEL_NAME, 'timestamp': datetime.now().isoformat()}}
+        with open(TEST_MODE_OUTPUT, 'w', encoding='utf-8') as f:
+            json.dump(test_output, f, indent=2, ensure_ascii=False)
+        print(f"\n💾 Test results saved to: {TEST_MODE_OUTPUT}")
 
 # ==========================================
 # PRODUCTION MODE FUNCTION
 # ==========================================
 def run_production_mode(client, facility_data):
-    """Run full production mode with meta-review generation"""
     print(f"\n{'='*70}")
-    print(f"🚀 PRODUCTION MODE - Processing All {len(facility_data):,} Facilities")
+    print(f"🚀 PRODUCTION MODE (GROQ) - Processing {len(facility_data):,} Facilities")
     print(f"{'='*70}\n")
-    print(f"⚠️ NOTE: Full prompts always sent to API (never truncated)")
-    print()
     
     state = GenerationState(STATE_FILE)
     
-    # Resume Logic
     if os.path.exists(OUTPUT_FILE) and state.state['last_batch_idx'] > 0:
         print(f"   📂 Resuming from batch {state.state['last_batch_idx']}...")
         existing_df = pd.read_parquet(OUTPUT_FILE)
@@ -526,9 +320,6 @@ def run_production_mode(client, facility_data):
         final_results = []
         start_idx = 0
 
-    # Processing Loop
-    print(f"\n[2/4] Processing {len(facility_data) - start_idx} remaining facilities...")
-    
     api_calls = state.state.get('api_calls', 0)
     failed_calls = state.state.get('failed_calls', 0)
     batch_number = state.state['last_batch_idx']
@@ -537,33 +328,21 @@ def run_production_mode(client, facility_data):
         batch_number += 1
         batch_data = facility_data[i:i+BATCH_SIZE]
         
-        # Process batch
         for facility_obj in batch_data:
-            # CLEAN THE PROMPT - Remove cluster references
             cleaned_prompt = clean_cluster_references(facility_obj['prompt'])
-            
-            # Get metadata
-            n_reviews = facility_obj['Total_Reviews']
-            n_summaries = facility_obj['n_summaries']
-            
-            # Create meta-prompt with CLEANED prompt (will return None if < 10 reviews)
-            # This always returns FULL prompt (never truncated)
-            meta_prompt = create_meta_prompt(cleaned_prompt, n_reviews, n_summaries)
+            meta_prompt = create_meta_prompt(cleaned_prompt, facility_obj['Total_Reviews'], facility_obj['n_summaries'])
             
             if not meta_prompt:
-                # Skip facilities with too few reviews
                 api_calls += 1
                 failed_calls += 1
                 continue
             
-            # Generate - ALWAYS send FULL prompt
             output = generate_with_retry(client, meta_prompt)
             api_calls += 1
             
             if output:
                 json_data = extract_json(output)
                 if json_data:
-                    # COMBINE: Pre-computed metadata + LLM summaries
                     combined_result = combine_results(facility_obj, json_data)
                     final_results.append(combined_result)
                 else:
@@ -571,6 +350,7 @@ def run_production_mode(client, facility_data):
             else:
                 failed_calls += 1
             
+            # Simple throttle strictly for rate limit compliance
             time.sleep(DELAY_BETWEEN_REQUESTS)
 
         # Checkpoint
@@ -586,48 +366,20 @@ def run_production_mode(client, facility_data):
                 api_calls=api_calls,
                 failed_calls=failed_calls
             )
-            
-            print(f"\n   💾 Checkpoint #{batch_number // CHECKPOINT_EVERY_N_BATCHES}:")
-            print(f"      Processed: {i + len(batch_data):,}/{len(facility_data):,}")
-            print(f"      Saved: {len(final_results):,}")
-            print(f"      Success Rate: {state.state['success_rate']:.1f}%")
+            print(f"  [Checkpoint Saved] Rows: {len(final_results)}")
 
-    # Final Save
-    print(f"\n[3/4] Saving final output...")
     if final_results:
         pd.DataFrame(final_results).to_parquet(OUTPUT_FILE)
         print(f"   ✅ Saved {len(final_results)} records to {OUTPUT_FILE}")
-    
-    print(f"\n{'='*70}")
-    print(f"📊 FINAL STATS")
-    print(f"{'='*70}")
-    print(f"Model: {MODEL_NAME}")
-    print(f"Temperature: {TEMPERATURE}")
-    print(f"Total API Calls: {api_calls}")
-    print(f"Success Rate: {(len(final_results)/api_calls*100) if api_calls > 0 else 0:.1f}%")
-    print(f"\n💡 Output Structure:")
-    print(f"   ✓ Metadata from Part 4: Facility, Total_Reviews, Key_Highlights")
-    print(f"   ✓ Generated by LLM: Summaries, Summaries_Korean")
-    print(f"   ✓ Full prompts always sent to API (never truncated)")
-    print(f"{'='*70}")
 
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
 def main():
     print("="*70)
-    print("Seoul Medical Meta-Reviews - Qwen 3 32B API")
-    print("Uses pre-computed metadata + LLM summaries")
-    print("Reduces hallucination risk on metadata")
-    print(f"Mode: {'🧪 TEST' if TEST_MODE else '🚀 PRODUCTION'}")
-    if TEST_MODE:
-        print(f"Print Full Prompt: {'YES' if PRINT_FULL_PROMPT else 'NO (preview only)'}")
-        print(f"Print Full Output: {'YES' if PRINT_FULL_OUTPUT else 'NO (preview only)'}")
-        print(f"Test Results Output: {TEST_MODE_OUTPUT}")
+    print(f"Seoul Medical Meta-Reviews - Groq API ({MODEL_NAME})")
     print("="*70)
     
-    # Load Data
-    print(f"\n[1/4] Loading prepared data from Part 4...")
     if not os.path.exists(INPUT_PROMPTS):
         print(f"❌ File not found: {INPUT_PROMPTS}")
         return
@@ -635,17 +387,12 @@ def main():
     with open(INPUT_PROMPTS, 'rb') as f:
         facility_data = pickle.load(f)
     
-    print(f"   ✓ Loaded {len(facility_data):,} facility objects")
-    print(f"   ✓ Each contains: prompt, Facility, Total_Reviews, Key_Highlights, metadata")
-    
-    # Setup Client
     try:
         client = setup_api_client()
     except ValueError as e:
         print(f"❌ {e}")
         return
     
-    # Run appropriate mode
     if TEST_MODE:
         run_test_mode(client, facility_data)
     else:

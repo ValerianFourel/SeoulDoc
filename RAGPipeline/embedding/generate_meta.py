@@ -2,7 +2,7 @@
 Seoul Medical Reviews - Part 5: Meta Summary Generation (LOCAL GPUs - ROBUST)
 ===============================================================================
 Parallel generation with 2x Qwen2.5-14B-Instruct instances on 4x A100 40GB
-UPDATED VERSION: Fixed Offload Folder Issue (Solution 1)
+FIXED VERSION: Proper Pad Token + Verbose Logging
 """
 
 import json
@@ -46,18 +46,21 @@ INSTANCE_2_GPUS = [2, 3]
 NUM_INSTANCES = 2
 
 # BATCH SIZES
-BATCH_SIZE_PER_INSTANCE = 16  # Per instance (total: 32 samples in parallel)
+BATCH_SIZE_PER_INSTANCE = 1  # Per instance (total: 2 samples in parallel)
 
 # SAVE FREQUENCY CONTROL
 SAVE_EVERY_N_BATCHES = 1  
-BACKUP_EVERY_N_BATCHES = 10  
-PRINT_PROGRESS_EVERY_N_BATCHES = 5  
+BACKUP_EVERY_N_BATCHES = 1  
+PRINT_PROGRESS_EVERY_N_BATCHES = 1  
 
 # Generation Parameters
 MAX_NEW_TOKENS = 4000 
 TEMPERATURE = 0.5 
 TOP_P = 0.9
 TOP_K = 50
+
+# Tokenization Parameters
+MAX_INPUT_LENGTH = 8192  # Maximum input sequence length
 
 # Memory allocation
 MAX_MEMORY_PER_GPU = "38GiB" # Leave slight buffer on A100 40GB
@@ -139,16 +142,31 @@ def extract_json(text: str) -> Optional[Dict[Any, Any]]:
     return None
 
 # ==========================================
-# MODEL SETUP (FIXED WITH OFFLOAD)
+# MODEL SETUP (CRITICAL FIX: PROPER PAD TOKEN)
 # ==========================================
 def setup_llm_instance(model_id, target_gpus, instance_name):
     """
-    Setup Qwen2.5-14B instance with explicit offload support
+    Setup Qwen2.5-14B instance with FIXED pad token configuration
+    CRITICAL FIX: Uses token ID 0 for padding instead of EOS token
     """
     try:
         print(f"    🚀 Loading {instance_name} on GPUs {target_gpus}...")
         
+        # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_id)
+        
+        # ============================================================
+        # CRITICAL FIX: Use token ID 0 for padding (NOT EOS token!)
+        # ============================================================
+        tokenizer.padding_side = "left"  # For batched inference
+        
+        # Use first token in vocabulary (ID 0) as padding
+        # This is a rarely-used token that won't confuse the model
+        tokenizer.pad_token_id = 0
+        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(0)
+        
+        print(f"      ✅ FIXED: Using token ID 0 for padding: '{tokenizer.pad_token}'")
+        print(f"      ✓ EOS token (NOT used for padding): '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
         
         # Max memory constraint to isolate instances
         num_gpus = torch.cuda.device_count()
@@ -171,7 +189,7 @@ def setup_llm_instance(model_id, target_gpus, instance_name):
             torch_dtype="auto",
             device_map="auto",
             max_memory=max_memory_dict,
-            offload_folder=offload_dir,  # <--- FIX: Provides safe place for spillover
+            offload_folder=offload_dir,
             low_cpu_mem_usage=True
         )
         
@@ -180,76 +198,132 @@ def setup_llm_instance(model_id, target_gpus, instance_name):
         
     except Exception as e:
         print(f"      ❌ {instance_name} loading failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None
 
 # ==========================================
-# GENERATION LOGIC (Standard Qwen2.5)
+# GENERATION LOGIC (FIXED TOKENIZATION)
 # ==========================================
-def generate_batch(model, tokenizer, prompts, max_new_tokens=MAX_NEW_TOKENS, temperature=TEMPERATURE):
+def generate_batch(model, tokenizer, prompts, instance_name="Unknown", max_new_tokens=MAX_NEW_TOKENS, temperature=TEMPERATURE):
     """
-    Generate text using Standard Qwen2.5 Instruct format
+    Generate text using Standard Qwen2.5 Instruct format with proper tokenization
     """
     if not prompts:
         return []
     
-    formatted_prompts = []
+    print(f"\n  [{instance_name}] 📝 Starting batch generation for {len(prompts)} prompt(s)")
     
-    # 1. Apply Template
-    for prompt in prompts:
-        # Added System Prompt for better JSON control
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant. You must output valid JSON only. No markdown, no explanations."},
-            {"role": "user", "content": prompt}
-        ]
+    try:
+        # 1. Apply Chat Template
+        print(f"  [{instance_name}] 🔧 Applying chat template...")
+        formatted_prompts = []
         
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
+        for idx, prompt in enumerate(prompts):
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant. You must output valid JSON only. No markdown, no explanations."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            formatted_prompts.append(text)
+            
+            # Log prompt length for debugging
+            approx_tokens = len(text.split())
+            print(f"  [{instance_name}]    Prompt {idx+1}: ~{approx_tokens} words")
+        
+        # 2. Tokenize with EXPLICIT parameters
+        print(f"  [{instance_name}] 🔧 Tokenizing with max_length={MAX_INPUT_LENGTH}...")
+        
+        model_inputs = tokenizer(
+            formatted_prompts, 
+            return_tensors="pt", 
+            padding=True,  # Pad to longest in batch
+            truncation=True,  # Truncate if too long
+            max_length=MAX_INPUT_LENGTH,  # EXPLICIT max length
+            return_attention_mask=True  # Ensure attention mask is returned
         )
-        formatted_prompts.append(text)
-    
-    # 2. Tokenize
-    model_inputs = tokenizer(
-        formatted_prompts, 
-        return_tensors="pt", 
-        padding=True, 
-        truncation=True
-    ).to(model.device)
-    
-    # 3. Generate
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **model_inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True if temperature > 0 else False,
-            top_p=TOP_P,
-            top_k=TOP_K,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
-        )
-    
-    # 4. Decode
-    results = []
-    for i, output_ids_full in enumerate(generated_ids):
-        # Calculate where the new tokens start
-        input_len = model_inputs.input_ids[i].shape[0]
-        output_ids = output_ids_full[input_len:]
         
-        # Standard decoding
-        text = tokenizer.decode(output_ids, skip_special_tokens=True)
-        results.append(text)
+        # Move to device
+        model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
         
-    return results
+        # Log tokenization results
+        input_shape = model_inputs['input_ids'].shape
+        print(f"  [{instance_name}]    ✓ Input shape: {input_shape}")
+        print(f"  [{instance_name}]    ✓ Max input tokens: {input_shape[1]}")
+        print(f"  [{instance_name}]    ✓ Attention mask shape: {model_inputs['attention_mask'].shape}")
+        print(f"  [{instance_name}]    ✓ Pad token ID: {tokenizer.pad_token_id}")
+        print(f"  [{instance_name}]    ✓ EOS token ID: {tokenizer.eos_token_id}")
+        
+        # Check for potential issues
+        if input_shape[1] > MAX_INPUT_LENGTH * 0.9:
+            print(f"  [{instance_name}]    ⚠️ WARNING: Input near max length, may affect generation")
+        
+        # 3. Generate
+        print(f"  [{instance_name}] 🚀 Generating (max_new_tokens={max_new_tokens})...")
+        
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True if temperature > 0 else False,
+                top_p=TOP_P,
+                top_k=TOP_K,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+        
+        print(f"  [{instance_name}] ✅ Generation complete!")
+        print(f"  [{instance_name}]    Output shape: {generated_ids.shape}")
+        
+        # 4. Decode
+        print(f"  [{instance_name}] 🔧 Decoding outputs...")
+        results = []
+        
+        for i, output_ids_full in enumerate(generated_ids):
+            # Calculate where the new tokens start
+            input_len = model_inputs['input_ids'][i].shape[0]
+            output_ids = output_ids_full[input_len:]
+            
+            # Decode only the generated part
+            text = tokenizer.decode(output_ids, skip_special_tokens=True)
+            results.append(text)
+            
+            # Log output length
+            print(f"  [{instance_name}]    Output {i+1}: {len(output_ids)} tokens, {len(text)} chars")
+        
+        print(f"  [{instance_name}] ✅ Batch complete!\n")
+        return results
+        
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"  [{instance_name}] ❌ CUDA OOM Error: {e}")
+        print(f"  [{instance_name}]    Clearing cache and returning empty results...")
+        torch.cuda.empty_cache()
+        return [""] * len(prompts)
+        
+    except Exception as e:
+        print(f"  [{instance_name}] ❌ Generation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return [""] * len(prompts)
 
 # ==========================================
-# PARALLEL ENGINE
+# PARALLEL ENGINE (VERBOSE LOGGING)
 # ==========================================
 class ParallelGenerator:
     def __init__(self, model_id, instance_configs):
         self.instances = []
         self.locks = []
+        self.instance_names = []
+        
+        print("\n" + "="*70)
+        print("Initializing Parallel Generator")
+        print("="*70)
         
         for name, gpus in instance_configs:
             model, tokenizer = setup_llm_instance(model_id, gpus, name)
@@ -258,13 +332,22 @@ class ParallelGenerator:
             
             self.instances.append({
                 'model': model,
-                'tokenizer': tokenizer
+                'tokenizer': tokenizer,
+                'name': name
             })
             self.locks.append(threading.Lock())
+            self.instance_names.append(name)
             
         print(f"\n    ✅ All {len(self.instances)} instances ready!")
+        print("="*70 + "\n")
     
     def generate_parallel(self, prompts_batch, batch_size_per_instance, **gen_kwargs):
+        """Generate in parallel with verbose progress tracking"""
+        
+        print(f"\n{'='*70}")
+        print(f"PARALLEL GENERATION: {len(prompts_batch)} prompts")
+        print(f"{'='*70}")
+        
         # Split batch for instances
         instance_batches = []
         
@@ -274,7 +357,11 @@ class ParallelGenerator:
         for i in range(len(self.instances)):
             start = i * chunk_size
             end = min(start + chunk_size, len(prompts_batch))
-            instance_batches.append(prompts_batch[start:end])
+            batch = prompts_batch[start:end]
+            instance_batches.append(batch)
+            print(f"  {self.instance_names[i]}: {len(batch)} prompts (indices {start}-{end-1})")
+        
+        print(f"{'='*70}\n")
         
         results_container = [None] * len(self.instances)
         
@@ -283,34 +370,52 @@ class ParallelGenerator:
                 results_container[idx] = []
                 return
             
+            instance_name = self.instances[idx]['name']
+            print(f"\n🔵 [{instance_name}] Starting processing...")
+            
             with self.locks[idx]:
                 inst = self.instances[idx]
-                out = generate_batch(inst['model'], inst['tokenizer'], p_batch, **gen_kwargs)
+                out = generate_batch(
+                    inst['model'], 
+                    inst['tokenizer'], 
+                    p_batch,
+                    instance_name=instance_name,
+                    **gen_kwargs
+                )
                 results_container[idx] = out
+            
+            print(f"🟢 [{instance_name}] Completed! Generated {len(out)} outputs\n")
                 
+        # Execute in parallel
         with ThreadPoolExecutor(max_workers=len(self.instances)) as executor:
             futures = []
             for i, batch in enumerate(instance_batches):
                 futures.append(executor.submit(run_instance, i, batch))
             
+            # Wait for all to complete
             for f in futures:
                 f.result()
-                
+        
         # Flatten results
         final_output = []
         for res in results_container:
             if res:
                 final_output.extend(res)
-                
+        
+        print(f"\n{'='*70}")
+        print(f"PARALLEL GENERATION COMPLETE: {len(final_output)} total outputs")
+        print(f"{'='*70}\n")
+        
         return final_output
 
     def cleanup(self):
+        print("\n🧹 Cleaning up GPU memory...")
         for instance in self.instances:
-            # Clean up offload directories if they exist
-            # Note: We don't delete the model object explicitly as gc handles it,
-            # but we could remove temp folders if desired.
-            pass
+            del instance['model']
+            del instance['tokenizer']
+        self.instances = []
         clear_gpu_memory()
+        print("✅ Cleanup complete\n")
 
 def clear_gpu_memory():
     gc.collect()
@@ -328,12 +433,20 @@ class RobustGenerationState:
     def load_state(self):
         if os.path.exists(self.state_file):
             try:
-                with open(self.state_file, 'r') as f: return json.load(f)
-            except: pass
+                with open(self.state_file, 'r') as f: 
+                    state = json.load(f)
+                    print(f"📂 Loaded state: {state}")
+                    return state
+            except: 
+                pass
         if os.path.exists(self.backup_file):
             try:
-                with open(self.backup_file, 'r') as f: return json.load(f)
-            except: pass
+                with open(self.backup_file, 'r') as f: 
+                    state = json.load(f)
+                    print(f"📂 Loaded backup state: {state}")
+                    return state
+            except: 
+                pass
         return {'last_batch_idx': 0, 'facilities_processed': 0, 'success_rate': 0.0}
 
     def save_state(self, batch_idx, processed, saved, force_backup=False):
@@ -343,37 +456,48 @@ class RobustGenerationState:
             'records_saved': saved,
             'timestamp': datetime.now().isoformat()
         })
-        with open(self.state_file, 'w') as f: json.dump(self.state, f)
-        if force_backup: shutil.copy2(self.state_file, self.backup_file)
+        with open(self.state_file, 'w') as f: 
+            json.dump(self.state, f, indent=2)
+        
+        if force_backup: 
+            shutil.copy2(self.state_file, self.backup_file)
+            print(f"💾 State saved and backed up")
+        else:
+            print(f"💾 State saved")
 
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
 def save_results_safely(results, output_file, backup_file):
     try:
+        print(f"\n💾 Saving {len(results)} results to {output_file}...")
         temp = output_file + ".tmp"
         pd.DataFrame(results).to_parquet(temp)
         shutil.move(temp, output_file)
+        print(f"✅ Save successful!")
         return True
     except Exception as e:
-        print(f"Save failed: {e}")
+        print(f"❌ Save failed: {e}")
         return False
 
 def main():
-    print("="*70)
+    print("\n" + "="*70)
     print("Seoul Medical - Qwen2.5-14B-Instruct Parallel Generation")
+    print("FIXED VERSION: Proper Pad Token (Token ID 0)")
     print("="*70)
     
     # 1. Load Data
+    print(f"\n📂 Loading input data from {INPUT_PROMPTS}...")
     if not os.path.exists(INPUT_PROMPTS):
         print(f"❌ Input file not found: {INPUT_PROMPTS}")
         return
         
     with open(INPUT_PROMPTS, 'rb') as f:
         facility_data = pickle.load(f)
-    print(f"Loaded {len(facility_data)} facilities")
+    print(f"✅ Loaded {len(facility_data)} facilities")
 
     # 2. Init Generator
+    print(f"\n🚀 Initializing parallel generator...")
     try:
         generator = ParallelGenerator(
             WRITER_LLM_ID,
@@ -381,9 +505,12 @@ def main():
         )
     except Exception as e:
         print(f"❌ Generator init failed: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
     # 3. Processing Loop
+    print(f"\n📊 Setting up processing state...")
     state_mgr = RobustGenerationState(STATE_FILE, BACKUP_STATE_FILE)
     
     # Resume logic
@@ -391,31 +518,62 @@ def main():
     if os.path.exists(OUTPUT_FILE):
         try:
             existing_results = pd.read_parquet(OUTPUT_FILE).to_dict('records')
-        except: pass
+            print(f"📂 Loaded {len(existing_results)} existing results")
+        except Exception as e:
+            print(f"⚠️ Could not load existing results: {e}")
     
-    start_idx = len(existing_results) # Simple resume based on count
+    start_idx = len(existing_results)
+    remaining = len(facility_data) - start_idx
     
-    print(f"Starting from index {start_idx}...")
+    print(f"\n{'='*70}")
+    print(f"PROCESSING PLAN:")
+    print(f"  Total facilities: {len(facility_data)}")
+    print(f"  Already processed: {start_idx}")
+    print(f"  Remaining: {remaining}")
+    print(f"  Batch size: {BATCH_SIZE_PER_INSTANCE * NUM_INSTANCES}")
+    print(f"{'='*70}\n")
+    
+    if remaining == 0:
+        print("✅ All facilities already processed!")
+        generator.cleanup()
+        return
     
     batch_size = BATCH_SIZE_PER_INSTANCE * NUM_INSTANCES
     current_results = []
     
-    # Batch Processing
-    for i in tqdm(range(start_idx, len(facility_data), batch_size)):
+    # Batch Processing with tqdm
+    print(f"🚀 Starting batch processing...\n")
+    
+    for batch_num, i in enumerate(tqdm(range(start_idx, len(facility_data), batch_size), 
+                                       desc="Processing batches")):
+        print(f"\n{'='*70}")
+        print(f"BATCH {batch_num + 1} (indices {i}-{min(i+batch_size, len(facility_data))-1})")
+        print(f"{'='*70}")
+        
         batch_data = facility_data[i : i + batch_size]
         prompts = []
         objs = []
         
+        # Prepare prompts
         for obj in batch_data:
-            p = create_meta_prompt(clean_cluster_references(obj['prompt']), obj['Total_Reviews'], obj['n_summaries'])
+            p = create_meta_prompt(
+                clean_cluster_references(obj['prompt']), 
+                obj['Total_Reviews'], 
+                obj['n_summaries']
+            )
             if p:
                 prompts.append(p)
                 objs.append(obj)
+        
+        print(f"\n📝 Prepared {len(prompts)} valid prompts from {len(batch_data)} facilities")
         
         if prompts:
             # GENERATE
             try:
                 outputs = generator.generate_parallel(prompts, BATCH_SIZE_PER_INSTANCE)
+                
+                print(f"\n🔍 Processing outputs...")
+                success_count = 0
                 
                 for obj, txt in zip(objs, outputs):
                     json_res = extract_json(txt)
@@ -423,17 +581,30 @@ def main():
                         full_res = combine_results(obj, json_res)
                         existing_results.append(full_res)
                         current_results.append(full_res)
+                        success_count += 1
+                    else:
+                        print(f"  ⚠️ Failed to extract JSON for {obj['Facility']}")
+                
+                print(f"✅ Successfully processed {success_count}/{len(objs)} facilities")
+                
             except Exception as e:
-                print(f"Error in batch: {e}")
+                print(f"❌ Error in batch: {e}")
+                import traceback
+                traceback.print_exc()
 
         # SAVE
         if len(current_results) > 0:
             save_results_safely(existing_results, OUTPUT_FILE, BACKUP_OUTPUT_FILE)
             state_mgr.save_state(i, i+len(batch_data), len(existing_results))
-            current_results = [] # Clear buffer
+            current_results = []
 
+    print(f"\n{'='*70}")
+    print(f"PROCESSING COMPLETE!")
+    print(f"  Total results: {len(existing_results)}")
+    print(f"{'='*70}\n")
+    
     generator.cleanup()
-    print("Done!")
+    print("✅ Done!")
 
 if __name__ == "__main__":
     main()
